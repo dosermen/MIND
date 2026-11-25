@@ -250,6 +250,20 @@ class MemBridge:
 ## 13. Вне v0 (дорожная карта)
 
 slice 1: MCP `serve` mind + тул `profile` в opencode.jsonc.
+slice 1.5: embed — гибридный recall (решение пользователя 25.11: «вектора должны быть»).
+  - Каскад ТОЛЬКО remote (телефон 5131 через `adb forward tcp:5031 tcp:5131`) → FTS,
+    как в mem; локальный embed-server НЕ поднимать (правило AGENTS.md). Телефон
+    недоступен/таймаут → молча FTS, футер `mode: fts (remote server down)`.
+  - Своя таблица `mind_vec` в mind.db (dim 1024, Q8_0) — в mem_vec НЕ лезть,
+    однонаправленность mind→mem сохраняется.
+  - Команды: `mind.py embed` (добивка недоставленных векторов) + гибридный
+    `recall` с весами, старт с mem-замеренных 0.45/0.20/0.10/0.25
+    (bm25/recency/importance/cosine), FTS-веса v0 остаются fallback'ом.
+  - Sweep: отдельная задача (hidden vbs) либо шаг в Mem-Sweep — решить при
+    реализации; инкремент по mtime, без повторных embed.
+  - **Гейт полезности (обязателен):** после калибровки, на ~50 записях —
+    A/B 10 запросов FTS vs гибрид; выигрыш < заметного → откатиться на FTS
+    и честно зафиксировать вердикт в память. Без замера не оставлять.
 slice 2: автоматика digest (фоновая задача через run-hidden.vbs).
 slice 3: eligible-журнал + детектор привычек.
 slice 4: resurrect (ночной, cosine >= 0.75 — порог doc_links mem).
