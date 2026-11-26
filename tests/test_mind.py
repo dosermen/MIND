@@ -33,6 +33,12 @@ def parse(text):
 class TestFrontmatter(unittest.TestCase):
     """dump -> parse roundtrip for every shape we use."""
 
+    def test_split_top_respects_escapes(self):
+        # review CRITICAL (26.11): \" inside a quoted value must not open
+        # a split point - `5" bolt, tight` used to be cut at the comma
+        parts = mind._split_top(r'a: "5\" bolt, tight", b: 2')
+        self.assertEqual(parts, ['a: "5\\" bolt, tight"', "b: 2"])
+
     SAMPLE = {
         "id": 3, "type": "trait", "path": "rigor", "status": "active",
         "version": 2, "author": "mind", "updated": "2026-11-25",
@@ -563,6 +569,174 @@ class TestTraitLifecycle(Base):
                        "novelty-v2.md").read_text(encoding="utf-8"))
         self.assertEqual(fm["value"], 0.7)
         self.assertEqual(fm["status"], "candidate")
+
+
+class TestTraitNote(Base):
+    """`note` - one-command entry point for observations (recalc rule,
+    docs/calibration.md): in-place, no version bump, digest reminds."""
+
+    def make_trait(self, name="rigor", **extra):
+        fm = {"status": "active", "scope": "agent", "value": 0.4,
+              "direction": "measure first",
+              "falsified_when": "ship blind twice", "confidence": 0.6}
+        fm.update(extra)
+        self.write_record("trait", name, fm)
+        self.sync()
+        return self.id_of("trait", name)
+
+    def test_note_in_place_no_version_bump(self):
+        tid = self.make_trait()
+        rc, out = self.run_main("note", str(tid), "shipped blind twice")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("side: none", out)
+        fm, _ = parse((self.root / "MIND" / "trait" /
+                       "rigor.md").read_text(encoding="utf-8"))
+        self.assertEqual(fm["version"], 1)
+        self.assertEqual(fm["notes"][0]["text"], "shipped blind twice")
+        self.assertEqual(fm["notes"][0]["date"], date.today().isoformat())
+        self.assertEqual(self.db_row(tid)["version"], 1)
+
+    def test_note_side_and_recall(self):
+        tid = self.make_trait()
+        rc, out = self.run_main("note", str(tid), "ship blind, no meter",
+                                "--side", "down")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_main("recall", "ship blind")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("rigor", out)
+
+    def test_note_gates(self):
+        self.write_record("habit", "h1", {"status": "active",
+                                          "scope": "agent",
+                                          "trigger": "t", "action": "a"})
+        self.sync()
+        hid = self.id_of("habit", "h1")
+        rc, out = self.run_main("note", str(hid), "x")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("expected type trait", out)
+        rc, out = self.run_main("note", "999", "x")
+        self.assertEqual(rc, 1, out)
+        rc, out = self.run_main("note", str(hid), "x", "--file", "f.md")
+        self.assertEqual(rc, 2, out)
+        rc, out = self.run_main("note", str(hid))
+        self.assertEqual(rc, 2, out)
+
+    def test_recalc_pending_in_digest(self):
+        tid = self.make_trait()
+        rc, out = self.run_main("digest", "--json")
+        self.assertEqual(json.loads(out)["recalc_pending"], [])
+        self.run_main("note", str(tid), "one blind ship", "--side", "down")
+        rc, out = self.run_main("digest", "--json")
+        self.assertEqual(json.loads(out)["recalc_pending"], [])
+        self.run_main("note", str(tid), "two blind ships", "--side", "down")
+        rc, out = self.run_main("digest", "--json")
+        pend = json.loads(out)["recalc_pending"]
+        self.assertEqual(len(pend), 1)
+        self.assertEqual(pend[0]["id"], tid)
+        self.assertEqual(pend[0]["side"], "down")
+        self.assertEqual(pend[0]["count"], 2)
+        self.assertEqual(pend[0]["value"], 0.4)
+        self.assertEqual(pend[0]["suggested"], 0.3)
+        rc, out = self.run_main("digest")
+        self.assertIn("2. recalc pending (1)", out)
+        self.assertIn("2xdown -> value 0.4 -> suggest 0.3", out)
+
+    def test_recalc_needs_same_side(self):
+        tid = self.make_trait()
+        self.run_main("note", str(tid), "blind ship", "--side", "down")
+        self.run_main("note", str(tid), "measured well", "--side", "up")
+        rc, out = self.run_main("digest", "--json")
+        self.assertEqual(json.loads(out)["recalc_pending"], [])
+
+    def test_value_update_consumes_notes(self):
+        tid = self.make_trait()
+        self.run_main("note", str(tid), "blind ship", "--side", "down")
+        self.run_main("note", str(tid), "blind again", "--side", "down")
+        src = self.root / "n-upd.md"
+        src.write_text(mind.dump_frontmatter({"value": 0.3}) + "recalc\n",
+                       encoding="utf-8")
+        rc, out = self.run_main("update", str(tid), "--file", str(src))
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_main("digest", "--json")
+        self.assertEqual(json.loads(out)["recalc_pending"], [])
+        # a non-value update keeps the notes
+        tid2 = self.make_trait(name="novelty2", value=0.65)
+        self.run_main("note", str(tid2), "a", "--side", "down")
+        self.run_main("note", str(tid2), "b", "--side", "down")
+        src.write_text(mind.dump_frontmatter({"direction": "new dir"})
+                       + "reword\n", encoding="utf-8")
+        rc, out = self.run_main("update", str(tid2), "--file", str(src))
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_main("digest", "--json")
+        self.assertEqual(len(json.loads(out)["recalc_pending"]), 1)
+
+    def test_note_file_success(self):
+        tid = self.make_trait()
+        p = self.root / "obs.md"
+        p.write_text("metered both runs before shipping\n", encoding="utf-8")
+        rc, out = self.run_main("note", str(tid), "--file", str(p))
+        self.assertEqual(rc, 0, out)
+        fm, _ = parse((self.root / "MIND" / "trait" /
+                       "rigor.md").read_text(encoding="utf-8"))
+        self.assertEqual(fm["notes"][0]["text"],
+                         "metered both runs before shipping")
+
+    def test_note_multiline_warns(self):
+        # _fmt flattens newlines: say so instead of mangling silently
+        tid = self.make_trait()
+        p = self.root / "m.md"
+        p.write_text("line one\nline two\n", encoding="utf-8")
+        rc, out = self.run_main("note", str(tid), "--file", str(p))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("WARN multi-line input flattened", out)
+
+    def test_note_roundtrip_quotes_and_commas(self):
+        # review CRITICAL: `_fmt` writes \" but _split_top had no escape
+        # handling - `5" bolt, tight` was silently cut at the comma and
+        # sync's stamp-back persisted the corruption
+        tid = self.make_trait()
+        messy = 'tighten to 5" bolt, then re-check'
+        rc, out = self.run_main("note", str(tid), messy)
+        self.assertEqual(rc, 0, out)
+        fm, _ = parse((self.root / "MIND" / "trait" /
+                       "rigor.md").read_text(encoding="utf-8"))
+        self.assertEqual(fm["notes"][0]["text"], messy)
+        rc, out = self.run_main("recall", "re-check")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("rigor", out)
+
+    def test_note_on_candidate_trait(self):
+        tid = self.make_trait(name="cand", status="candidate")
+        rc, out = self.run_main("note", str(tid), "observed early")
+        self.assertEqual(rc, 0, out)
+
+    def test_recalc_conflict_reported(self):
+        tid = self.make_trait()
+        for side in ("up", "up", "down", "down"):
+            self.run_main("note", str(tid), f"x {side}", "--side", side)
+        rc, out = self.run_main("digest", "--json")
+        pend = json.loads(out)["recalc_pending"]
+        self.assertEqual(len(pend), 1)
+        self.assertEqual(pend[0]["side"], "conflict")
+        self.assertIsNone(pend[0]["suggested"])
+        rc, out = self.run_main("digest")
+        self.assertIn("CONFLICT 2up vs 2down", out)
+
+    def test_recalc_clamped_at_bound(self):
+        # no-op suggestions are skipped (1.0 + up can't move)
+        tid = self.make_trait(name="at-top", value=1.0)
+        for _ in range(2):
+            self.run_main("note", str(tid), "more", "--side", "up")
+        rc, out = self.run_main("digest", "--json")
+        self.assertEqual(json.loads(out)["recalc_pending"], [])
+        # 0.95 + up clamps to 1.0 and IS worth showing
+        tid2 = self.make_trait(name="near-top", value=0.95)
+        for _ in range(2):
+            self.run_main("note", str(tid2), "more", "--side", "up")
+        rc, out = self.run_main("digest", "--json")
+        pend = json.loads(out)["recalc_pending"]
+        self.assertEqual(len(pend), 1)
+        self.assertEqual(pend[0]["suggested"], 1.0)
 
 
 class TestProfileDigest(Base):
@@ -1294,7 +1468,7 @@ class TestVetoHonesty(Base):
                               "block_conditions": ["push github"]})
         rc, out = self.run_main("digest")
         self.assertEqual(rc, 0, out)
-        self.assertIn("6. settings (1)", out)
+        self.assertIn("7. settings (1)", out)
         self.assertIn("veto=hint", out)
         self.assertIn("NOT enforced", out)
 

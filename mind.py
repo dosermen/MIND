@@ -138,17 +138,31 @@ def _scalar(v):
 
 
 def _split_top(s):
-    """Split on commas at depth 0, respecting quotes."""
+    """Split on commas at depth 0, respecting quotes and backslash escapes.
+
+    Roundtrip review (26.11): _fmt writes `\\"` inside double quotes, but
+    the old char-loop had no escape handling - the escaped quote closed
+    the quote state and a later comma SPLIT the value, silently cutting
+    note text like `5" bolt, tight` (probe-confirmed, persisted by sync).
+    """
     parts, depth, cur, q = [], 0, "", None
-    for ch in s:
+    i, n = 0, len(s)
+    while i < n:
+        ch = s[i]
         if q:
+            if q == '"' and ch == "\\" and i + 1 < n:
+                cur += ch + s[i + 1]   # keep the escape pair for _unquote
+                i += 2
+                continue
             cur += ch
             if ch == q:
                 q = None
+            i += 1
             continue
         if ch in ("\"", "'"):
             q = ch
             cur += ch
+            i += 1
             continue
         if ch in "[{":
             depth += 1
@@ -157,8 +171,10 @@ def _split_top(s):
         if ch == "," and depth == 0:
             parts.append(cur)
             cur = ""
+            i += 1
             continue
         cur += ch
+        i += 1
     if cur.strip():
         parts.append(cur)
     return [p.strip() for p in parts]
@@ -918,8 +934,31 @@ def get_record(root, target):
             "rel": row["file"]}
 
 
+def _num_eq(a, b):
+    """Numeric equality with str fallback (1 vs 1.0, '0.40' vs 0.4).
+
+    str() equality alone false-cleared trait notes when the same value
+    was written differently (review 26.11).
+    """
+    try:
+        return float(a) == float(b)
+    except (TypeError, ValueError):
+        return str(a) == str(b)
+
+
 def save_record(root, rec, fm):
     """Write fm back in place (no version bump) + resync."""
+    # lossy guard (review note): stamping a record whose frontmatter has
+    # constructs this parser cannot roundtrip would silently destroy them
+    try:
+        raw = rec["file"].read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        raw = ""
+    lossy = _lossy_fm(raw)
+    if lossy:
+        print(f"refusing to rewrite lossy frontmatter "
+              f"({'; '.join(lossy)}): {rec['rel']}")
+        return 1
     write_md(rec["file"], fm, rec["body"])
     # lenient: the mutation already validated THIS record; a foreign
     # broken file must not roll back the mutation (review: strict rc lie)
@@ -1141,6 +1180,17 @@ def cmd_update(args):
         print(f"update: record is {rec['row']['status']}, not editable")
         return 1
     old_fm = rec["fm"]
+    # lossy guard (review 26.11): update stamps the record file back, so
+    # constructs this parser cannot roundtrip would be destroyed here too
+    try:
+        raw_rec = rec["file"].read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        raw_rec = ""
+    lossy = _lossy_fm(raw_rec)
+    if lossy:
+        print(f"update: refusing to rewrite lossy frontmatter "
+              f"({'; '.join(lossy)}): {rec['rel']}")
+        return 1
     if args.file:
         try:
             raw = Path(args.file).read_text(encoding="utf-8-sig")
@@ -1203,6 +1253,14 @@ def cmd_update(args):
         print(f"update: {new_fm['type']} {old_st} -> {new_st} not allowed "
               f"through update; use {prog}")
         return 1
+
+    # a value recalc consumes the pending notes: they were the trigger,
+    # keeping them would re-fire the digest reminder forever; an explicit
+    # `notes:` in --file is user input and survives (review 26.11)
+    if (new_fm.get("type") == "trait"
+            and not _num_eq(old_fm.get("value"), new_fm.get("value"))
+            and "notes" not in src_fm):
+        new_fm.pop("notes", None)
 
     errs, warns = validate_record(new_fm, "update")
     if not _print_validation(errs, warns, "update"):
@@ -1764,6 +1822,55 @@ def cmd_trait_approve(args):
     return rc
 
 
+def cmd_note(args):
+    """Log an observation against a trait (in-place, no version bump).
+
+    The recalc rule in docs/calibration.md needs facts to act on; `note`
+    is the one-command entry point for them. side=up confirms direction
+    (value should rise), side=down argues against it; 2 same-side notes
+    make `digest` remind about a +-0.1 recalc. Notes are consumed by the
+    next value change (cmd_update clears them).
+    """
+    if bool(args.text) == bool(args.file):
+        print("note: exactly one of TEXT or --file is required")
+        return 2
+    root = find_root()
+    rec, rc = _require_type(root, args.target, "trait")
+    if rec is None:
+        return rc
+    if args.file:
+        try:
+            text = Path(args.file).read_text(encoding="utf-8-sig").strip()
+        except (OSError, UnicodeDecodeError) as e:
+            print(f"note: cannot read {args.file}: {e}")
+            return 2
+    else:
+        text = (args.text or "").strip()
+    if not text:
+        print("note: empty text")
+        return 2
+    if "\n" in text:
+        # _fmt flattens newlines (single-line YAML) - say so, don't mangle silently
+        print("note: WARN multi-line input flattened to one line",
+              file=sys.stderr)
+    fm = dict(rec["fm"])
+    notes = fm.get("notes")
+    if not isinstance(notes, list):
+        notes = []
+    entry = {"date": _today()}
+    if args.side:
+        entry["side"] = args.side
+    entry["text"] = text
+    notes.append(entry)
+    fm["notes"] = notes
+    rc = save_record(root, rec, fm)
+    if rc == 0:
+        side = args.side or "none"
+        print(f"note {rec['row']['id']}@v{rec['row']['version']} added "
+              f"(side: {side}, {len(notes)} total)")
+    return rc
+
+
 # ---------------------------------------------------------------------------
 # habit lifecycle
 # ---------------------------------------------------------------------------
@@ -2217,6 +2324,44 @@ def cmd_digest(args):
             if reasons:
                 revision.append({"id": r["id"], "path": r["path"],
                                  "reasons": reasons})
+        # recalc pending: 2 same-side notes = the calibration rule's
+        # trigger; notes are cleared by the next value change
+        recalc = []
+        for r in db.execute(
+                "SELECT * FROM memories WHERE type='trait' AND "
+                "status NOT IN ('superseded','deleted')"):
+            try:
+                fm = json.loads(r["fm_json"] or "{}")
+            except (TypeError, ValueError):
+                fm = {}
+            notes = fm.get("notes")
+            if not isinstance(notes, list):
+                continue
+            sides = {"up": 0, "down": 0}
+            for n in notes:
+                if isinstance(n, dict) and n.get("side") in sides:
+                    sides[n["side"]] += 1
+            if sides["up"] < 2 and sides["down"] < 2:
+                continue
+            try:
+                val = float(fm.get("value"))
+            except (TypeError, ValueError):
+                continue
+            if sides["up"] >= 2 and sides["down"] >= 2:
+                # contradictory evidence must not masquerade as one-sided
+                recalc.append({"id": r["id"], "path": r["path"],
+                               "side": "conflict", "up": sides["up"],
+                               "down": sides["down"], "value": val,
+                               "suggested": None})
+                continue
+            side = "down" if sides["down"] >= 2 else "up"
+            delta = 0.1 if side == "up" else -0.1
+            suggested = round(min(1.0, max(0.0, val + delta)), 2)
+            if suggested == val:
+                continue   # clamped at a bound: the reminder would be a no-op
+            recalc.append({"id": r["id"], "path": r["path"], "side": side,
+                           "count": sides[side], "value": val,
+                           "suggested": suggested})
         # who enforces each setting (honest label, user 26.11): an
         # advisory mode with a hard-veto list means nobody executes it
         settings = []
@@ -2241,6 +2386,7 @@ def cmd_digest(args):
             "ideas": {"wip": wip, "ready_for_testing": ready,
                       "parked": parked_n},
             "habit_revision": revision,
+            "recalc_pending": recalc,
             "settings": settings,
             "mem": {"state": mem["state"],
                     "detail": mem["detail"] or None,
@@ -2256,31 +2402,43 @@ def cmd_digest(args):
         print(f"   {p['kind']} {p['id']} {p['path']} [{p['status']}]")
     if not pending:
         print("   (clean)")
-    print(f"2. ideas: wip {len(wip)}, ready-for-testing {len(ready)}, "
+    print(f"2. recalc pending ({len(recalc)})")
+    for rc_ in recalc:
+        if rc_["side"] == "conflict":
+            print(f"   trait {rc_['id']} {rc_['path']}: CONFLICT "
+                  f"{rc_['up']}up vs {rc_['down']}down -> value "
+                  f"{rc_['value']}, resolve manually")
+        else:
+            print(f"   trait {rc_['id']} {rc_['path']}: {rc_['count']}x"
+                  f"{rc_['side']} -> value {rc_['value']} -> "
+                  f"suggest {rc_['suggested']}")
+    if not recalc:
+        print("   (clean)")
+    print(f"3. ideas: wip {len(wip)}, ready-for-testing {len(ready)}, "
           f"parked {parked_n}")
     for w in wip:
         print(f"   {w['id']} {w['path']} [{w['status']}]")
-    print(f"3. habit revision due: {len(revision)}")
+    print(f"4. habit revision due: {len(revision)}")
     for h in revision:
         print(f"   {h['id']} {h['path']}: {', '.join(h['reasons'])}")
     st = mem["state"]
     if st == "ok":
-        print("4. mem contract: OK")
+        print("5. mem contract: OK")
     elif st == "drift":
-        print("4. mem contract: DRIFT")
+        print("5. mem contract: DRIFT")
         for d in data["mem"]["drifts"]:
             print(f"   - {d}")
     else:
-        print(f"4. mem contract: DOWN ({mem['detail']})")
+        print(f"5. mem contract: DOWN ({mem['detail']})")
     broken = mem["broken"]
     if broken is None:
-        print("5. broken citations: (mem unavailable, skipped)")
+        print("6. broken citations: (mem unavailable, skipped)")
     elif broken:
-        print(f"5. broken citations: {', '.join(broken)}")
+        print(f"6. broken citations: {', '.join(broken)}")
     else:
-        print("5. broken citations: none")
+        print("6. broken citations: none")
     if settings:
-        print(f"6. settings ({len(settings)})")
+        print(f"7. settings ({len(settings)})")
         for s in settings:
             if s["mode"] == "hint":
                 state = (f"advisory, hard-veto {s['conditions']} "
@@ -2422,6 +2580,13 @@ def main(argv=None):
     g.add_argument("--keep", action="store_true")
     g.add_argument("--deprecate", action="store_true")
 
+    p = sub.add_parser("note", help="log an observation on a trait")
+    p.add_argument("target")
+    p.add_argument("text", nargs="?")
+    p.add_argument("--file")
+    p.add_argument("--side", choices=("up", "down"),
+                   help="up: confirms direction, down: argues against")
+
     p = sub.add_parser("profile", help="compact self-block")
     p.add_argument("--scope", choices=("agent", "project", "companion"))
     p.add_argument("--json", action="store_true")
@@ -2445,7 +2610,7 @@ def main(argv=None):
         "forget": cmd_forget, "restore": cmd_restore, "list": cmd_list,
         "show": cmd_show, "link": cmd_link, "recall": cmd_recall,
         "profile": cmd_profile, "digest": cmd_digest, "doctor": cmd_doctor,
-        "veto": cmd_veto,
+        "veto": cmd_veto, "note": cmd_note,
     }
     if args.cmd == "idea":
         fn = {"new": cmd_idea_new, "status": cmd_idea_status,
@@ -2462,7 +2627,7 @@ def main(argv=None):
     mutating = {cmd_remember, cmd_update, cmd_forget, cmd_restore,
                 cmd_sync, cmd_link, cmd_idea_new, cmd_idea_status,
                 cmd_idea_kill, cmd_habit_approve, cmd_habit_exception,
-                cmd_habit_revise, cmd_trait_approve}
+                cmd_habit_revise, cmd_trait_approve, cmd_note}
     try:
         if fn in mutating:
             with MindLock(find_root()):

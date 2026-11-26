@@ -167,6 +167,7 @@ python mind.py habit exception ID --why TEXT
 python mind.py habit revise ID --keep|--deprecate
 
 python mind.py trait approve ID           # candidate -> active, approved_by=user, approved_at=today
+python mind.py note ID (TEXT | --file F) [--side up|down]   # observation on a trait, in-place
 
 python mind.py profile [--scope S] [--json]
 python mind.py digest [--json]
@@ -231,6 +232,12 @@ candidate --approve--> active    # только `trait approve` (approved_by=use
 (та же логика честности, что veto шаг 1). Черта-кандидат НЕ попадает в profile,
 НО видна в recall (поиск — это не утверждение) и в digest под «pending approval».
 
+**Наблюдения — `note ID TEXT [--side up|down]`**: факт по черте in-place, версия не
+бампается (механика `habit exception`), поле `notes: [{date, side?, text}]` индексируется
+в recall. `side=up` подтверждает direction, `down` — против; 2 note с одной стороны →
+digest-секция `recalc_pending` («N×side → предложи value±0.1»). Следующий `update`,
+меняющий `value`, очищает учтённые notes.
+
 ## 8. Recall (v0 = FTS)
 
 - Источник поиска: `search_text` = тело файла + все скалярные значения frontmatter
@@ -253,11 +260,14 @@ hard-veto условий.
 
 `digest` — pending одним списком (один раз в сутки, не размазано):
 1. candidate-привычки/черты, ждущие approve;
-2. идеи: WIP-список, drafted с criterion (готовы к testing), parked с истёкшими preconditions — нет;
-3. привычки: expires<=today или exceptions>=3;
-4. doctor mem: статус контракта (drift -> warn; mem down -> warn, не фатал);
-5. битые `related_mem`-цитаты (сверка показом через bridge, только при живом mem);
-6. settings: mode + кто исполняет (`hint` -> `NOT enforced (executor: none)`),
+2. recalc pending: >=2 note с одной стороны на trait -> «N×side, value X
+   -> X±0.1»; обе стороны >=2 -> `CONFLICT ... resolve manually`; на границе
+   (0.0/1.0) предложение-невозможность не выводится;
+3. идеи: WIP-список, drafted с criterion (готовы к testing), parked с истёкшими preconditions — нет;
+4. привычки: expires<=today или exceptions>=3;
+5. doctor mem: статус контракта (drift -> warn; mem down -> warn, не фатал);
+6. битые `related_mem`-цитаты (сверка показом через bridge, только при живом mem);
+7. settings: mode + кто исполняет (`hint` -> `NOT enforced (executor: none)`),
    сколько hard-veto условий висит без исполнителя.
 
 `--json` у обоих — структурированный вывод.
