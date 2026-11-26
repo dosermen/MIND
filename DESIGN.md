@@ -10,7 +10,9 @@
 3. Связь с mem однонаправленная: только чтение через MCP (`mem-bridge.py`), цитаты `id@vN`.
 4. Никаких правок в `F:\AI\MEM` и `F:\AI\OLAMA\memory`.
 5. ASCII в коде; русский — в md/документации.
-6. Embedding в v0 НЕТ: recall честно печатает `mode: fts (vectors: n/a)`.
+6. Embedding (slice 1.5): каскад ТОЛЬКО remote (телефон) → FTS; локальный
+   embed-server не поднимать. Recall по умолчанию FTS (`mode: fts (vectors: n/a)`),
+   гибрид — opt-in `MIND_RECALL=hybrid` до A/B-гейта (~50 записей, §13).
 
 ## 1. Раскладка
 
@@ -168,6 +170,7 @@ python mind.py habit revise ID --keep|--deprecate
 
 python mind.py trait approve ID           # candidate -> active, approved_by=user, approved_at=today
 python mind.py note ID (TEXT | --file F) [--side up|down]   # observation on a trait, in-place
+python mind.py embed                    # fill mind_vec, remote phone only, sig increment
 
 python mind.py profile [--scope S] [--json]
 python mind.py digest [--json]
@@ -249,6 +252,19 @@ digest-секция `recalc_pending` («N×side → предложи value±0.1�
 - Дефолт: limit 10, бюджет 6000 B на тела (как mem).
 - Вывод: `id@vN [type] path (updated, score)` + тело + `related_mind -> ..` / `related_mem -> ..`
   в конце: `mode: fts (vectors: n/a)`.
+
+### Гибрид (slice 1.5, opt-in `MIND_RECALL=hybrid`)
+
+- Своя таблица `mind_vec` в mind.db (dim/model на строку, sig = sha1(content));
+  `mind.py embed` добивает недостающее батчами (EMBED_BATCH 16) через remote
+  `/v1/embeddings`; сироты и векторы superseded-версий чистятся при embed.
+  Успешные батчи коммитятся — при упавшем remote rc=1 и resume со следующего запуска.
+- Кандидаты = FTS-хиты + записи, которых FTS не нашёл, но cosine(query) >= 0.30
+  (векторный добор). Формула: `0.45*bm25 + 0.20*recency + 0.10*importance + 0.25*cos`
+  (веса mem, замеренные 16.11); bm25 у векторного добра = 0; cos clamp [0,1].
+- Футеры честные: `hybrid` / `hybrid partial k/n` / `fts (no vectors yet)` /
+  `fts (remote server down)` (телефон мёртв — молча отдаём FTS, как mem).
+- Дефолт остаётся чистым FTS до A/B-гейта (§13): без замера гибрид не включается.
 
 ## 9. profile и digest
 
@@ -337,7 +353,8 @@ class MemBridge:
 | битая цитата | doctor/digest помечают, не чинят молча |
 | mode=block без veto_executor | ошибка валидации sync/remember (не молчим: вето негде исполнять) |
 | veto-плагин не загружен / mind недоступен | fail-open: без вето, ошибка в `logs/veto-hook.log`; после первой удачной загрузки работают последние известные правила |
-| mind.db удалён/устарел | sync пересобирает из md (auto-resync, как ensure_fresh) |
+| mind.db удалён/устарел | sync пересобирает из md (auto-resync, как ensure_fresh); mind_vec переживает пересборку (id из fm), сироты чистит embed |
+| embed remote (телефон) недоступен | rc=1 `embed: remote unavailable after N written (M left)` — записанные батчи сохранены, resume при следующем запуске; recall → FTS `fts (remote server down)` |
 
 ## 12. Тесты
 
@@ -350,7 +367,7 @@ class MemBridge:
 ## 13. Вне v0 (дорожная карта)
 
 slice 1: MCP `serve` mind + тул `profile` в opencode.jsonc.
-slice 1.5: embed — гибридный recall (решение пользователя 25.11: «вектора должны быть»).
+slice 1.5: embed — гибридный recall. **Реализовано 26.11** (секция «Гибрид» в §8):
   - Каскад ТОЛЬКО remote (телефон 5131 через `adb forward tcp:5031 tcp:5131`) → FTS,
     как в mem; локальный embed-server НЕ поднимать (правило AGENTS.md). Телефон
     недоступен/таймаут → молча FTS, футер `mode: fts (remote server down)`.
@@ -360,10 +377,11 @@ slice 1.5: embed — гибридный recall (решение пользова�
     `recall` с весами, старт с mem-замеренных 0.45/0.20/0.10/0.25
     (bm25/recency/importance/cosine), FTS-веса v0 остаются fallback'ом.
   - Sweep: отдельная задача (hidden vbs) либо шаг в Mem-Sweep — решить при
-    реализации; инкремент по mtime, без повторных embed.
-  - **Гейт полезности (обязателен):** после калибровки, на ~50 записях —
+    реализации (embed пока ручной); инкремент по sig, без повторных embed.
+  - **Гейт полезности (обязателен, ОСТАЁТСЯ):** после калибровки, на ~50 записях —
     A/B 10 запросов FTS vs гибрид; выигрыш < заметного → откатиться на FTS
-    и честно зафиксировать вердикт в память. Без замера не оставлять.
+    и честно зафиксировать вердикт в память. Без замера не оставлять
+    (поэтому гибрид opt-in `MIND_RECALL=hybrid`, дефолт — FTS).
 slice 2: автоматика digest (фоновая задача через run-hidden.vbs).
 slice 3: eligible-журнал + детектор привычек.
 slice 4: resurrect (ночной, cosine >= 0.75 — порог doc_links mem).

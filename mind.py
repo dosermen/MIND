@@ -12,13 +12,18 @@ stdlib only, single file (mem principle). ASCII in code.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
+import struct
 import sys
 import time
 import traceback
+import urllib.error
+import urllib.request
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -67,6 +72,16 @@ RECALL_BUDGET = 6000
 RECENCY_DAYS = 30.0
 W_BM25, W_REC, W_IMP = 0.60, 0.25, 0.15
 
+# slice 1.5: embed + hybrid recall (DESIGN 13). Remote-only on purpose:
+# the phone behind `adb forward tcp:5031 tcp:5131` (AGENTS.md - never
+# spawn a local embed-server). Weights are mem's measured hybrid set.
+EMBED_URL_DEFAULT = "http://127.0.0.1:5031/v1/embeddings"
+EMBED_MODEL_DEFAULT = "Qwen3-Embedding-0.6B"
+EMBED_TIMEOUT_S = 60
+EMBED_BATCH = 16
+W_HYB_BM25, W_HYB_REC, W_HYB_IMP, W_HYB_COS = 0.45, 0.20, 0.10, 0.25
+HYBRID_MIN_COS = 0.30   # vector-only candidates below this are ignored
+
 # per-type default status: a blind "active" is invalid for idea/trait/habit
 # (review: remember --type idea always failed on the default)
 DEFAULT_STATUS = {
@@ -100,6 +115,15 @@ CREATE TABLE IF NOT EXISTS memories (
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(search_text);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+-- slice 1.5: own vector store (dim/model recorded per row; NEVER mem_vec)
+CREATE TABLE IF NOT EXISTS mind_vec (
+  mem_id INTEGER PRIMARY KEY,
+  sig TEXT NOT NULL,
+  dim INTEGER NOT NULL,
+  model TEXT,
+  vec BLOB NOT NULL,
+  updated TEXT
+);
 """
 
 _bridge_mod = None
@@ -1506,7 +1530,147 @@ def cmd_link(args):
 
 
 # ---------------------------------------------------------------------------
-# recall (v0 = FTS, no vectors)
+# embed + hybrid recall (slice 1.5, DESIGN 13): remote-only, own mind_vec
+# ---------------------------------------------------------------------------
+
+def _embed_url():
+    # read at call time so tests (and a moved forward) can override env
+    return os.environ.get("MIND_EMBED_URL", EMBED_URL_DEFAULT)
+
+
+def _embed_model():
+    return os.environ.get("MIND_EMBED_MODEL", EMBED_MODEL_DEFAULT)
+
+
+def _vec_sig(text):
+    return hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()
+
+
+def embed_budget(texts):
+    """Seconds to wait for one /v1/embeddings response (mem formula):
+    the phone embeds ~100 chars/s (measured 327 tok = 10-16 s); 2.5x
+    margin (total//40), floor 60 s, cap 600 s - a dead peer stalls a
+    small run for ~1 min, not ten."""
+    total = sum(len(t) for t in texts)
+    return min(600, max(EMBED_TIMEOUT_S, total // 40 + EMBED_TIMEOUT_S))
+
+
+# corporate-proxy audit (mem 16.11): local embed must bypass http_proxy
+_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def embed_texts(texts):
+    """POST /v1/embeddings to the remote server, index-ordered vectors.
+
+    Raises URLError/OSError/RuntimeError/ValueError on any failure: the
+    caller keeps already-written batches and reports rc=1 - nothing is
+    lost, the next run resumes by sig."""
+    payload = json.dumps({"model": _embed_model(),
+                          "input": texts}).encode("utf-8")
+    req = urllib.request.Request(
+        _embed_url(), data=payload,
+        headers={"Content-Type": "application/json"})
+    try:
+        with _opener.open(req, timeout=embed_budget(texts)) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        # surface the server's own reason instead of a bare URL (mem audit)
+        body = e.read()[:300].decode("utf-8", errors="replace")
+        raise RuntimeError(f"embed HTTP {e.code}: {body}") from e
+    items = sorted(data.get("data", []), key=lambda d: d.get("index", 0))
+    vecs = [it.get("embedding") for it in items]
+    if len(vecs) != len(texts) or any(v is None for v in vecs):
+        raise RuntimeError(f"bad embeddings response: {len(vecs)}/{len(texts)}")
+    for v in vecs:
+        if any(not math.isfinite(x) for x in v):
+            raise RuntimeError("embeddings response contains NaN/inf")
+    return vecs
+
+
+def pack_vec(v):
+    return struct.pack(f"<{len(v)}f", *v)
+
+
+def unpack_vec(b):
+    return struct.unpack(f"<{len(b) // 4}f", b)
+
+
+def cosine(a, b):
+    if not a or len(a) != len(b):
+        # dim mismatch (model swapped under the same name): never compare
+        # partially - zip() would truncate to the shorter one (mem audit)
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def cmd_embed(args):
+    """Fill mind_vec for records whose search_text/model changed (1.5).
+
+    Increment by sig = sha1(search_text) + model: a rerun embeds only what
+    is missing. Remote-only (phone via adb forward): a down server is
+    rc=1 with already-written batches kept - the next run resumes.
+    """
+    root = find_root()
+    ensure_index(root)
+    model = _embed_model()
+    db = open_db(root)
+    done = 0
+    todo = []
+    try:
+        # sync rebuilds memories but keeps mind_vec: drop orphans and
+        # vectors of superseded versions first (update mints a new id)
+        db.execute("DELETE FROM mind_vec WHERE mem_id NOT IN "
+                   "(SELECT id FROM memories)")
+        db.execute("DELETE FROM mind_vec WHERE mem_id IN "
+                   "(SELECT id FROM memories WHERE status IN "
+                   "('superseded','deleted'))")
+        stored = {r["mem_id"]: (r["sig"], r["model"]) for r in
+                  db.execute("SELECT mem_id, sig, model FROM mind_vec")}
+        for r in db.execute(
+                "SELECT id, content FROM memories "
+                "WHERE status NOT IN ('superseded','deleted')"):
+            text = r["content"] or ""   # sync stores search_text as content
+            sig = _vec_sig(text)
+            if stored.get(r["id"]) != (sig, model):
+                todo.append((r["id"], sig, text))
+        if not todo:
+            db.commit()
+            print(f"embed: 0 pending ({len(stored)} vectors current, "
+                  f"model {model})")
+            return 0
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for i in range(0, len(todo), EMBED_BATCH):
+            batch = todo[i:i + EMBED_BATCH]
+            vecs = embed_texts([t for _, _, t in batch])
+            for (rid, sig, _), v in zip(batch, vecs):
+                db.execute(
+                    "INSERT INTO mind_vec (mem_id, sig, dim, model, vec, "
+                    "updated) VALUES (?,?,?,?,?,?) ON CONFLICT(mem_id) "
+                    "DO UPDATE SET sig=excluded.sig, dim=excluded.dim, "
+                    "model=excluded.model, vec=excluded.vec, "
+                    "updated=excluded.updated",
+                    (rid, sig, len(v), model, pack_vec(v), now))
+                done += 1
+            db.commit()
+    except (urllib.error.URLError, OSError, RuntimeError, ValueError) as e:
+        db.commit()   # keep whatever the completed batches wrote
+        print(f"embed: remote unavailable after {done} written "
+              f"({len(todo) - done} left): {e}")
+        return 1
+    finally:
+        db.close()
+    print(f"embed: {done} vectors written ({len(todo)} pending, "
+          f"model {model})")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# recall (v0 = FTS; hybrid opt-in via MIND_RECALL=hybrid, slice 1.5)
 # ---------------------------------------------------------------------------
 
 def _preview(r):
@@ -1546,15 +1710,64 @@ def cmd_recall(args):
             return 1
         if args.type:
             rows = [r for r in rows if r["type"] == args.type]
+        fts_ids = {r["id"] for r in rows}
+
+        # --- hybrid half (slice 1.5): cosine over mind_vec, opt-in via
+        # MIND_RECALL=hybrid. Default stays pure FTS until the A/B
+        # usefulness gate (DESIGN 13) passes on ~50 records.
+        mode = "fts (vectors: n/a)"
+        cos_by_id = {}
+        if os.environ.get("MIND_RECALL", "fts").lower() == "hybrid":
+            vec_rows = list(db.execute(
+                "SELECT v.mem_id, v.vec FROM mind_vec v "
+                "JOIN memories m ON m.id = v.mem_id "
+                "WHERE m.status NOT IN ('superseded','deleted')"))
+            if not vec_rows:
+                # embed never ran: no phone call at all (cheap honest FTS)
+                mode = "fts (no vectors yet)"
+            else:
+                try:
+                    qvec = embed_texts([args.query])[0]
+                except (urllib.error.URLError, OSError, RuntimeError,
+                        ValueError):
+                    # dead phone must not stall the search (mem rule)
+                    qvec = None
+                    mode = "fts (remote server down)"
+                if qvec is not None:
+                    have = {r["id"] for r in rows}
+                    for vr in vec_rows:
+                        c = cosine(qvec, unpack_vec(vr["vec"]))
+                        if vr["mem_id"] in have:
+                            cos_by_id[vr["mem_id"]] = c
+                        elif c >= HYBRID_MIN_COS:
+                            # vector-only candidate: FTS missed it
+                            m = db.execute(
+                                "SELECT * FROM memories WHERE id=?",
+                                (vr["mem_id"],)).fetchone()
+                            if m and (not args.type
+                                      or m["type"] == args.type):
+                                rows.append(m)
+                                cos_by_id[m["id"]] = c
+                    withv = sum(1 for r in rows if r["id"] in cos_by_id)
+                    mode = ("hybrid" if withv == len(rows)
+                            else f"hybrid partial {withv}/{len(rows)}")
         if not rows:
             print("no hits")
             return 1
-        bm = [-float(r["b"] or 0.0) for r in rows]
-        lo, hi = min(bm), max(bm)
+        # bm25 min-max over FTS hits ONLY: a vector-only candidate has no
+        # bm25 evidence and must not stretch the normalization range
+        fts_bm = [-float(r["b"] or 0.0) for r in rows
+                  if r["id"] in fts_ids]
+        lo, hi = (min(fts_bm), max(fts_bm)) if fts_bm else (0.0, 0.0)
+        bm = [-float(r["b"] or 0.0) if r["id"] in fts_ids else 0.0
+              for r in rows]
         today = date.today()
         scored = []
         for r, b in zip(rows, bm):
-            bn = 1.0 if hi == lo else (b - lo) / (hi - lo)
+            if r["id"] in fts_ids:
+                bn = 1.0 if hi == lo else (b - lo) / (hi - lo)
+            else:
+                bn = 0.0   # vector-only candidate: no bm25 evidence
             try:
                 d = date.fromisoformat(str(r["updated_at"])[:10])
                 age = max(0.0, (today - d).days)
@@ -1566,7 +1779,13 @@ def cmd_recall(args):
             except (TypeError, ValueError):
                 imp = 3
             inn = min(5, max(1, imp)) / 5.0
-            scored.append((W_BM25 * bn + W_REC * rn + W_IMP * inn, r))
+            if mode.startswith("hybrid"):
+                c = min(1.0, max(0.0, cos_by_id.get(r["id"], 0.0)))
+                score = (W_HYB_BM25 * bn + W_HYB_REC * rn
+                         + W_HYB_IMP * inn + W_HYB_COS * c)
+            else:
+                score = W_BM25 * bn + W_REC * rn + W_IMP * inn
+            scored.append((score, r))
         scored.sort(key=lambda x: -x[0])
         limit = RECALL_LIMIT if args.limit is None else max(0, args.limit)
         top = scored[:limit]
@@ -1624,7 +1843,7 @@ def cmd_recall(args):
                 print(f"[related_mem -> {', '.join(map(str, rm))}]")
             shown += 1
         print(f"\n-- {shown}/{len(scored)} hits, budget left {budget} B, "
-              f"mode: fts (vectors: n/a)")
+              f"mode: {mode}")
         return 0 if shown else 1
     finally:
         db.close()
@@ -2587,6 +2806,9 @@ def main(argv=None):
     p.add_argument("--side", choices=("up", "down"),
                    help="up: confirms direction, down: argues against")
 
+    sub.add_parser("embed",
+                   help="fill mind vectors (remote phone only, slice 1.5)")
+
     p = sub.add_parser("profile", help="compact self-block")
     p.add_argument("--scope", choices=("agent", "project", "companion"))
     p.add_argument("--json", action="store_true")
@@ -2610,7 +2832,7 @@ def main(argv=None):
         "forget": cmd_forget, "restore": cmd_restore, "list": cmd_list,
         "show": cmd_show, "link": cmd_link, "recall": cmd_recall,
         "profile": cmd_profile, "digest": cmd_digest, "doctor": cmd_doctor,
-        "veto": cmd_veto, "note": cmd_note,
+        "veto": cmd_veto, "note": cmd_note, "embed": cmd_embed,
     }
     if args.cmd == "idea":
         fn = {"new": cmd_idea_new, "status": cmd_idea_status,
@@ -2627,7 +2849,7 @@ def main(argv=None):
     mutating = {cmd_remember, cmd_update, cmd_forget, cmd_restore,
                 cmd_sync, cmd_link, cmd_idea_new, cmd_idea_status,
                 cmd_idea_kill, cmd_habit_approve, cmd_habit_exception,
-                cmd_habit_revise, cmd_trait_approve, cmd_note}
+                cmd_habit_revise, cmd_trait_approve, cmd_note, cmd_embed}
     try:
         if fn in mutating:
             with MindLock(find_root()):

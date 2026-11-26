@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """MIND slice 0 tests: frontmatter, sync, CRUD, lifecycles, recall,
-profile/digest, doctor against the stub mem server.
+profile/digest, doctor against the stub mem server; slice 1.5 embed +
+hybrid recall against a local embeddings stub.
 
 Run from F:\\AI\\MIND:  python -m unittest discover -s tests -v
 Every test runs against a temp MIND_ROOT (the real store is never touched).
 """
 import contextlib
+import http.server
 import io
 import json
 import os
@@ -13,7 +15,9 @@ import re
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
+import zlib
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -737,6 +741,197 @@ class TestTraitNote(Base):
         pend = json.loads(out)["recalc_pending"]
         self.assertEqual(len(pend), 1)
         self.assertEqual(pend[0]["suggested"], 1.0)
+
+
+# ---------------------------------------------------------------------------
+# slice 1.5: embed + hybrid recall against a local embeddings stub
+# ---------------------------------------------------------------------------
+
+def _stub_vec(text):
+    """Deterministic bag-of-words vector: similar texts -> close vectors."""
+    v = [0.0] * 64
+    for w in re.findall(r"\w+", str(text).lower()):
+        v[zlib.crc32(w.encode("utf-8")) % 64] += 1.0
+    return v
+
+
+class _EmbedStubHandler(http.server.BaseHTTPRequestHandler):
+    # tests pin exact query vectors here to simulate semantic neighbours
+    # that share no words with the record (vector-only recall path)
+    overrides = {}
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        try:
+            req = json.loads(self.rfile.read(n))
+        except ValueError:
+            req = {}
+        out = []
+        for t in req.get("input", []):
+            out.append(type(self).overrides.get(t) or _stub_vec(t))
+        body = json.dumps(
+            {"data": [{"index": i, "embedding": v}
+                      for i, v in enumerate(out)]}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+class TestEmbedHybrid(Base):
+    """`embed` (mind_vec, sig increment, remote-only) + MIND_RECALL=hybrid."""
+
+    DEAD_URL = "http://127.0.0.1:9/v1/embeddings"   # discard port: refused
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), _EmbedStubHandler)
+        threading.Thread(target=cls.server.serve_forever,
+                         daemon=True).start()
+        cls.stub_url = ("http://127.0.0.1:"
+                        f"{cls.server.server_address[1]}/v1/embeddings")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        _EmbedStubHandler.overrides.clear()
+
+    def setUp(self):
+        super().setUp()
+        os.environ["MIND_EMBED_URL"] = self.stub_url
+
+    def tearDown(self):
+        os.environ.pop("MIND_EMBED_URL", None)
+        os.environ.pop("MIND_RECALL", None)
+        _EmbedStubHandler.overrides.clear()
+        super().tearDown()
+
+    def make_trait(self, name="rigor", body=""):
+        self.write_record("trait", name,
+                          {"status": "active", "scope": "agent",
+                           "value": 0.4, "direction": "measure first",
+                           "falsified_when": "ship blind"}, body)
+        self.sync()
+        return self.id_of("trait", name)
+
+    def vec_count(self):
+        db = mind.open_db(self.root)
+        try:
+            return db.execute("SELECT COUNT(*) AS n FROM mind_vec"
+                              ).fetchone()["n"]
+        finally:
+            db.close()
+
+    # -- embed ---------------------------------------------------------
+    def test_embed_writes_then_increment(self):
+        tid = self.make_trait(body="measure everything twice\n")
+        rc, out = self.run_main("embed")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("1 vectors written", out)
+        self.assertEqual(self.vec_count(), 1)
+        # second run: sig unchanged -> nothing to do
+        rc, out = self.run_main("embed")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("0 pending", out)
+        # changing the record changes search_text -> sig -> 1 pending
+        src = self.root / "upd.md"
+        src.write_text(mind.dump_frontmatter(
+            {"direction": "measure with a meter"}) + "x\n", encoding="utf-8")
+        rc, out = self.run_main("update", str(tid), "--file", str(src))
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_main("embed")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("1 vectors written", out)
+        self.assertEqual(self.vec_count(), 1)
+
+    def test_embed_remote_down_is_rc1_nothing_lost(self):
+        self.make_trait()
+        os.environ["MIND_EMBED_URL"] = self.DEAD_URL
+        rc, out = self.run_main("embed")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("remote unavailable", out)
+        self.assertEqual(self.vec_count(), 0)
+
+    # -- recall: opt-in hybrid ----------------------------------------
+    def test_default_recall_stays_fts(self):
+        self.make_trait(body="needle in a haystack\n")
+        rc, out = self.run_main("embed")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_main("recall", "needle")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("mode: fts (vectors: n/a)", out)
+
+    def test_hybrid_footer_and_ranking(self):
+        self.make_trait(body="needle in a haystack\n")
+        self.run_main("embed")
+        os.environ["MIND_RECALL"] = "hybrid"
+        rc, out = self.run_main("recall", "needle")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("mode: hybrid", out)
+        self.assertNotIn("fts (", out)
+
+    def test_hybrid_no_vectors_yet(self):
+        self.make_trait(body="needle in a haystack\n")
+        os.environ["MIND_RECALL"] = "hybrid"     # embed never ran
+        rc, out = self.run_main("recall", "needle")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("fts (no vectors yet)", out)
+
+    def test_hybrid_remote_down_falls_back_to_fts(self):
+        self.make_trait(body="needle in a haystack\n")
+        self.run_main("embed")
+        os.environ["MIND_RECALL"] = "hybrid"
+        os.environ["MIND_EMBED_URL"] = self.DEAD_URL
+        rc, out = self.run_main("recall", "needle")
+        self.assertEqual(rc, 0, out)             # FTS half still serves
+        self.assertIn("fts (remote server down)", out)
+        rc, out = self.run_main("recall", "zznonexistent")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("no hits", out)
+
+    def test_hybrid_finds_vector_only_candidate(self):
+        tid = self.make_trait(body="disk defrag schedule\n")
+        self.run_main("embed")
+        # the query shares no words with the record, but the stub returns
+        # the record's own vector for it -> cosine 1.0 must surface it
+        db = mind.open_db(self.root)
+        try:
+            vec = mind.unpack_vec(db.execute(
+                "SELECT vec FROM mind_vec WHERE mem_id=?", (tid,)
+            ).fetchone()["vec"])
+        finally:
+            db.close()
+        _EmbedStubHandler.overrides["hidden needle"] = list(vec)
+        # pure FTS cannot see it (0 hits)...
+        rc, out = self.run_main("recall", "hidden needle")
+        self.assertEqual(rc, 1, out)
+        # ...hybrid can
+        os.environ["MIND_RECALL"] = "hybrid"
+        rc, out = self.run_main("recall", "hidden needle")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("rigor", out)
+        self.assertIn("mode: hybrid", out)
+
+    def test_hybrid_partial_footer(self):
+        self.make_trait(name="alpha", body="needle alpha\n")
+        self.run_main("embed")                   # alpha gets a vector
+        for n in ("beta", "gamma"):
+            self.write_record("trait", n,
+                              {"status": "active", "scope": "agent",
+                               "value": 0.5, "direction": "d",
+                               "falsified_when": "f"},
+                              f"needle {n}\n")
+        self.sync()                              # beta/gamma: no vector yet
+        os.environ["MIND_RECALL"] = "hybrid"
+        rc, out = self.run_main("recall", "needle")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("hybrid partial 1/3", out)
 
 
 class TestProfileDigest(Base):
