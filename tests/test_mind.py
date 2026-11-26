@@ -217,7 +217,7 @@ class TestCrud(Base):
     def test_remember_with_file(self):
         p = self.root / "in.md"
         p.write_text(mind.dump_frontmatter({
-            "type": "trait", "path": "novelty", "status": "active",
+            "type": "trait", "path": "novelty", "status": "candidate",
             "version": 1, "author": "calib", "updated": "2026-11-25",
             "scope": "agent", "value": 0.8,
             "direction": "prefer non-trivial paths",
@@ -227,6 +227,10 @@ class TestCrud(Base):
         self.assertEqual(rc, 0)
         self.assertIn("remembered", out)
         self.assertIn("trait/novelty.md", out)
+        # entry gate: a trait import lands at candidate, not active
+        fm, _ = parse((self.root / "MIND" / "trait" /
+                       "novelty.md").read_text(encoding="utf-8"))
+        self.assertEqual(fm["status"], "candidate")
         rc, out = self.run_main("recall", "non-trivial paths")
         self.assertEqual(rc, 0)
         self.assertIn("novelty", out)
@@ -465,6 +469,100 @@ class TestHabit(Base):
                                 "--why", "too early")
         self.assertEqual(rc, 1)
         self.assertIn("only an active habit", out)
+
+    def test_update_file_cannot_activate(self):
+        # same honesty rule as trait: status rides only on approve/revise
+        hid = self.make_candidate()
+        src = self.root / "h-upd.md"
+        src.write_text(mind.dump_frontmatter({"status": "active"}) + "x\n",
+                       encoding="utf-8")
+        rc, out = self.run_main("update", str(hid), "--file", str(src))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("habit approve", out)
+        self.assertEqual(self.db_row(hid)["status"], "candidate")
+
+
+class TestTraitLifecycle(Base):
+    """Entry gate + `trait approve` (option 1, approved 26.11): the agent
+    cannot activate a trait about the user by itself - veto step-1 logic."""
+
+    def make_candidate(self):
+        self.write_record("trait", "novelty",
+                          {"status": "candidate", "scope": "agent",
+                           "value": 0.65, "direction": "try non-trivial first",
+                           "falsified_when": "chose the usual path twice",
+                           "confidence": 0.6})
+        self.sync()
+        return self.id_of("trait", "novelty")
+
+    def test_remember_gate_refuses_active_trait(self):
+        src = self.root / "tr-gate.md"
+        src.write_text(mind.dump_frontmatter({
+            "type": "trait", "path": "rigor", "status": "active",
+            "scope": "agent", "value": 0.4, "direction": "measure first",
+            "falsified_when": "ship blind twice",
+        }) + "x\n", encoding="utf-8")
+        rc, out = self.run_main("remember", "--file", str(src))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("must start as 'candidate'", out)
+        self.assertIn("trait approve", out)
+        # no status given -> entry default is candidate
+        src.write_text(mind.dump_frontmatter({
+            "type": "trait", "path": "rigor", "scope": "agent",
+            "value": 0.4, "direction": "measure first",
+            "falsified_when": "ship blind twice",
+        }) + "x\n", encoding="utf-8")
+        rc, out = self.run_main("remember", "--file", str(src))
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.db_row(self.id_of("trait", "rigor"))["status"],
+                         "candidate")
+
+    def test_candidate_hidden_from_profile_shown_in_digest(self):
+        tid = self.make_candidate()
+        rc, out = self.run_main("profile", "--json")
+        self.assertEqual(json.loads(out)["traits"], [])
+        rc, out = self.run_main("digest", "--json")
+        pending = json.loads(out)["pending"]
+        self.assertIn({"kind": "trait", "id": tid, "path": "novelty",
+                       "status": "candidate"}, pending)
+
+    def test_approve(self):
+        tid = self.make_candidate()
+        rc, out = self.run_main("trait", "approve", str(tid))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("candidate -> active", out)
+        fm, _ = parse((self.root / "MIND" / "trait" /
+                       "novelty.md").read_text(encoding="utf-8"))
+        self.assertEqual(fm["status"], "active")
+        self.assertEqual(fm["approved_by"], "user")
+        self.assertEqual(fm["approved_at"], date.today().isoformat())
+        rc, out = self.run_main("profile", "--json")
+        self.assertEqual(json.loads(out)["traits"][0]["path"], "novelty")
+        # not twice
+        rc, out = self.run_main("trait", "approve", str(tid))
+        self.assertEqual(rc, 1)
+        self.assertIn("not a candidate", out)
+
+    def test_update_file_status_bypass_blocked(self):
+        tid = self.make_candidate()
+        src = self.root / "tr-upd.md"
+        src.write_text(mind.dump_frontmatter({"status": "active"}) + "x\n",
+                       encoding="utf-8")
+        rc, out = self.run_main("update", str(tid), "--file", str(src))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("trait approve", out)
+        self.assertEqual(self.db_row(tid)["status"], "candidate")
+        # value-only recalc rides through and keeps the status
+        src.write_text(mind.dump_frontmatter({"value": 0.7}) + "bump\n",
+                       encoding="utf-8")
+        rc, out = self.run_main("update", str(tid), "--file", str(src))
+        self.assertEqual(rc, 0, out)
+        # old version -> superseded, new version carries candidate on
+        self.assertEqual(self.db_row(tid)["status"], "superseded")
+        fm, _ = parse((self.root / "MIND" / "trait" /
+                       "novelty-v2.md").read_text(encoding="utf-8"))
+        self.assertEqual(fm["value"], 0.7)
+        self.assertEqual(fm["status"], "candidate")
 
 
 class TestProfileDigest(Base):

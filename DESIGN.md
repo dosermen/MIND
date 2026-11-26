@@ -139,7 +139,8 @@ F:\AI\MIND\
   `exceptions, approved_by, approved_at, eligibles, hits, resurrected, expires,
   predelete_status, killed_by, killed_at, approved/status-переходы lifecycle`.
   Содержательные поля (`direction, hypothesis, summary, action, mode, ...`) — только через `update`.
-- Lifecycle-команды (`idea status`, `habit approve`, ...) правят frontmatter in-place
+- Lifecycle-команды (`idea status`, `habit approve`, `trait approve`, ...) правят
+  frontmatter in-place
   (status + тип-поля), версию не бампят: история lifecycle = эти поля + `updated`.
 
 ## 5. CLI
@@ -165,6 +166,8 @@ python mind.py habit approve ID           # candidate -> active, approved_by=use
 python mind.py habit exception ID --why TEXT
 python mind.py habit revise ID --keep|--deprecate
 
+python mind.py trait approve ID           # candidate -> active, approved_by=user, approved_at=today
+
 python mind.py profile [--scope S] [--json]
 python mind.py digest [--json]
 python mind.py doctor mem [--json] [--deep]
@@ -180,8 +183,8 @@ python mind.py veto ACTION [--list] [--json]   # хард-veto правила, �
 (ровно один источник: TEXT или --file, как в mem; rc=2 при обоих/ни одного).
 Исключения: `update --file` не принимает `id, version, supersedes, updated, path, type`
 (операционная идентичность — из самой записи), а `remember`/`idea new` не могут создать
-idea/habit сразу в не-entry статусе (idea: `spark`, habit: `candidate`) — это обход
-WIP-лимита и гейта approve.
+idea/habit/trait сразу в не-entry статусе (idea: `spark`, habit/trait: `candidate`) — это
+обход WIP-лимита и гейта approve.
 
 `remember` без `--path`: path = slug из первого слова/типа (дефолт: `type-YYYYMMDD-HHMMSS`).
 
@@ -215,6 +218,18 @@ candidate --approve--> active --revise--> deprecated
 
 `habit exception`: appends `{date, why}` in-place. Ревизия через `expires` (90 дней дефолт).
 Привычка с `status: candidate` НИКОГДА не попадает в profile как действующая.
+
+## 7а. Жизненный цикл trait
+
+```
+candidate --approve--> active    # только `trait approve` (approved_by=user)
+                                # пересчёты value через update: статус НЕ меняется
+```
+
+Гейт на входе (26.11): `remember` не создаёт trait в не-entry статусе и `update --file`
+со сменой статуса закрыт — агент не может сам активировать черту о пользователе
+(та же логика честности, что veto шаг 1). Черта-кандидат НЕ попадает в profile,
+НО видна в recall (поиск — это не утверждение) и в digest под «pending approval».
 
 ## 8. Recall (v0 = FTS)
 

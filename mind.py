@@ -1049,14 +1049,17 @@ def cmd_remember(args):
     if args.author:
         fm["author"] = args.author
     # creation must start at the type's entry status (review M4): a
-    # --file frontmatter must not mint an idea already in testing or a
-    # habit already active - those gates belong to status/approve cmds
+    # --file frontmatter must not mint an idea already in testing, a
+    # habit already active or a trait already active - those gates
+    # belong to status/approve cmds (no self-sanction: the agent cannot
+    # activate a trait about the user by itself, veto step-1 logic)
     want_st = fm.get("status")
     entry_st = DEFAULT_STATUS.get(typ, "active")
-    if typ in ("idea", "habit") and want_st not in (None, "", entry_st):
+    if typ in ("idea", "habit", "trait") and want_st not in (None, "", entry_st):
+        prog = {"idea": "`idea status`", "habit": "`habit approve`",
+                "trait": "`trait approve`"}[typ]
         print(f"remember: new {typ} must start as {entry_st!r} "
-              f"(got {want_st!r}); progress it with "
-              "`idea status` / `habit approve`")
+              f"(got {want_st!r}); progress it with {prog}")
         return 1
     fm["status"] = want_st or entry_st
     fm.setdefault("version", 1)
@@ -1189,6 +1192,17 @@ def cmd_update(args):
             if cur + add > WIP_MAX:
                 print(f"update: idea WIP full ({WIP_MAX} drafted/testing)")
                 return 1
+
+    # trait/habit status changes never ride through update --file: they
+    # belong to their approve/revise cmds (same honesty rule as remember,
+    # otherwise the entry gate above is decorative)
+    if new_st and new_st != old_st and new_fm.get("type") in ("trait",
+                                                              "habit"):
+        prog = ("`trait approve`" if new_fm["type"] == "trait"
+                else "`habit approve`/`habit revise`")
+        print(f"update: {new_fm['type']} {old_st} -> {new_st} not allowed "
+              f"through update; use {prog}")
+        return 1
 
     errs, warns = validate_record(new_fm, "update")
     if not _print_validation(errs, warns, "update"):
@@ -1719,6 +1733,34 @@ def cmd_idea_kill(args):
     if rc == 0:
         print(f"idea {rec['row']['id']}: testing -> lost "
               f"(killed_by: {args.by})")
+    return rc
+
+
+# ---------------------------------------------------------------------------
+# trait lifecycle
+# ---------------------------------------------------------------------------
+
+def cmd_trait_approve(args):
+    """candidate -> active, approved_by=user (mirrors habit approve).
+
+    The entry gate in cmd_remember keeps agent-minted traits at
+    candidate; only the user's word promotes them into profile.
+    """
+    root = find_root()
+    rec, rc = _require_type(root, args.target, "trait")
+    if rec is None:
+        return rc
+    fm = dict(rec["fm"])
+    if fm.get("status") != "candidate":
+        print(f"trait approve: not a candidate (status={fm.get('status')})")
+        return 1
+    fm["status"] = "active"
+    fm["approved_by"] = "user"
+    fm["approved_at"] = _today()
+    fm["updated"] = _today()
+    rc = save_record(root, rec, fm)
+    if rc == 0:
+        print(f"trait {rec['row']['id']}: candidate -> active")
     return rc
 
 
@@ -2362,6 +2404,11 @@ def main(argv=None):
     p.add_argument("target")
     p.add_argument("--by", required=True)
 
+    pt = sub.add_parser("trait", help="trait lifecycle")
+    tsub = pt.add_subparsers(dest="action", required=True)
+    p = tsub.add_parser("approve")
+    p.add_argument("target")
+
     ph = sub.add_parser("habit", help="habit lifecycle")
     hsub = ph.add_subparsers(dest="action", required=True)
     p = hsub.add_parser("approve")
@@ -2407,13 +2454,15 @@ def main(argv=None):
         fn = {"approve": cmd_habit_approve,
               "exception": cmd_habit_exception,
               "revise": cmd_habit_revise}[args.action]
+    elif args.cmd == "trait":
+        fn = {"approve": cmd_trait_approve}[args.action]
     else:
         fn = table[args.cmd]
     # single-writer lock around every mutation (read commands stay lockless)
     mutating = {cmd_remember, cmd_update, cmd_forget, cmd_restore,
                 cmd_sync, cmd_link, cmd_idea_new, cmd_idea_status,
                 cmd_idea_kill, cmd_habit_approve, cmd_habit_exception,
-                cmd_habit_revise}
+                cmd_habit_revise, cmd_trait_approve}
     try:
         if fn in mutating:
             with MindLock(find_root()):
