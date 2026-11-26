@@ -281,14 +281,32 @@ def write_md(path, fm, body):
 # root / db / index
 # ---------------------------------------------------------------------------
 
+def _is_mind_root(p):
+    """A real project root, not just any directory with a MIND subdir.
+
+    Review (26.11): the bare `(p / "MIND").is_dir()` marker matched a
+    workspace root that merely CONTAINS a project named MIND - running
+    from F:\\AI\\OLAMA walked up to F:\\AI, built a second store there
+    and sprayed records outside the project. The records marker now
+    requires MIND/ to look like a records tree (a type subdir), and a
+    bare MIND/ without a database or index no longer qualifies.
+    """
+    if (p / "MIND.md").is_file() or (p / "mind.db").is_file():
+        return True
+    md = p / "MIND"
+    if md.is_dir():
+        return any((md / t).is_dir()
+                   for t in ("trait", "habit", "idea", "insight", "setting"))
+    return False
+
+
 def find_root():
     env = os.environ.get("MIND_ROOT")
     if env:
         return Path(env).resolve()
     cwd = Path.cwd().resolve()
     for p in (cwd, *cwd.parents):
-        if ((p / "MIND.md").is_file() or (p / "mind.db").is_file()
-                or (p / "MIND").is_dir()):
+        if _is_mind_root(p):
             return p
     return HERE  # script IS the project (mem deliberately does not do this)
 

@@ -1298,6 +1298,56 @@ class TestVetoCommand(Base):
         self.assertIn("explicit yes", out)
 
 
+class TestFindRoot(unittest.TestCase):
+    """Root detection must not adopt a workspace that merely contains a
+    project directory named MIND (bug 26.11: remember from F:\\AI\\OLAMA
+    walked up to F:\\AI and built a store outside the project)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name).resolve()
+        self.old_cwd = Path.cwd()
+        self.old_root = os.environ.pop("MIND_ROOT", None)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        os.chdir(self.old_cwd)
+        if self.old_root is not None:
+            os.environ["MIND_ROOT"] = self.old_root
+        else:
+            os.environ.pop("MIND_ROOT", None)
+        self.tmp.cleanup()
+
+    def test_workspace_with_named_dir_is_not_root(self):
+        # F:\AI\MIND as a project FOLDER under a workspace root
+        (self.ws / "MIND").mkdir()          # empty: not a records tree
+        os.chdir(self.ws)
+        self.assertEqual(mind.find_root(), mind.HERE)
+
+    def test_bare_mind_dir_without_records_is_not_root(self):
+        (self.ws / "MIND" / "docs").mkdir(parents=True)
+        os.chdir(self.ws)
+        self.assertEqual(mind.find_root(), mind.HERE)
+
+    def test_records_tree_matches(self):
+        (self.ws / "MIND" / "setting").mkdir(parents=True)
+        os.chdir(self.ws)
+        self.assertEqual(mind.find_root(), self.ws)
+
+    def test_db_marker_matches(self):
+        (self.ws / "mind.db").write_bytes(b"")
+        os.chdir(self.ws)
+        self.assertEqual(mind.find_root(), self.ws)
+
+    def test_env_root_wins_over_markers(self):
+        (self.ws / "MIND" / "setting").mkdir(parents=True)
+        other = Path(self.tmp.name) / "elsewhere"
+        other.mkdir()
+        os.environ["MIND_ROOT"] = str(other)
+        os.chdir(self.ws)
+        self.assertEqual(mind.find_root(), other.resolve())
+
+
 REAL_MEM = Path(r"F:\AI\OLAMA\tools\mem.py")
 
 
