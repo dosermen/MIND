@@ -4,3 +4,6 @@ __pycache__/
 *.pyc
 logs/
 MIND.md
+# personal data, local only (repo went public 26.11)
+docs/calibration.md
+MIND/trait/
