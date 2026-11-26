@@ -1832,5 +1832,152 @@ class TestRealMemIntegration(unittest.TestCase):
                         "deep recall found nothing in the real store")
 
 
+class TestMcpServe(Base):
+    """Slice 1: the MCP stdio server - tools/list, dispatch, loop."""
+
+    EXPECTED = {"recall", "profile", "digest", "show", "list", "note",
+                "remember", "update", "forget", "restore", "veto",
+                "idea", "habit"}
+
+    def tools(self):
+        return {t["name"]: t for t in mind._mcp_tools()}
+
+    def test_tools_list_matches_expected(self):
+        t = self.tools()
+        self.assertEqual(set(t), self.EXPECTED)
+        # gates must be visible in the schema descriptions
+        self.assertIn("CANDIDATES", t["remember"]["description"])
+        self.assertIn("user", t["remember"]["description"])
+
+    def test_dispatch_read_paths(self):
+        self.make_insight("i1", summary="body probe summary")
+        self.sync()
+        text, err = mind._mcp_dispatch("recall", {"query": "body"})
+        self.assertFalse(err, text)
+        self.assertIn("i1", text)
+        text, err = mind._mcp_dispatch("profile", {})
+        self.assertFalse(err, text)
+        self.assertIn("MIND profile", text)
+        text, err = mind._mcp_dispatch("digest", {})
+        self.assertFalse(err, text)
+
+    def test_dispatch_missing_required(self):
+        text, err = mind._mcp_dispatch("recall", {})
+        self.assertTrue(err)
+        self.assertIn("query", text)
+        text, err = mind._mcp_dispatch("note", {"target": "4"})
+        self.assertTrue(err)
+        self.assertIn("text", text)
+
+    def test_dispatch_unknown_tool_and_bad_args(self):
+        text, err = mind._mcp_dispatch("nosuch", {})
+        self.assertTrue(err)
+        self.assertIn("unknown tool", text)
+        text, err = mind._mcp_dispatch("recall", "not-a-dict")
+        self.assertTrue(err)
+
+    def test_dispatch_mutating_wraps_lock_and_writes(self):
+        # every type is structured: the MCP client sends frontmatter in
+        # `text` (no temp-file etiquette over JSON-RPC)
+        text = mind.dump_frontmatter({
+            "type": "insight", "path": "mcp-created",
+            "version": 1, "author": "test", "updated": "2026-11-26",
+            "scope": "agent", "summary": "created via MCP dispatch",
+            "prediction": "p"}) + "note body\n"
+        out, err = mind._mcp_dispatch("remember", {"text": text})
+        self.assertFalse(err, out)
+        p = self.root / "MIND" / "insight" / "mcp-created.md"
+        self.assertTrue(p.is_file(), "dispatch remember did not write md")
+        self.assertIn("remembered", out)
+
+    def test_dispatch_veto_needs_action_or_list(self):
+        text, err = mind._mcp_dispatch("veto", {})
+        self.assertTrue(err)
+        text, err = mind._mcp_dispatch("veto", {"list": True})
+        self.assertFalse(err, text)
+
+    def test_dispatch_idea_and_habit_validation(self):
+        text, err = mind._mcp_dispatch("idea", {"action": "new"})
+        self.assertTrue(err)
+        self.assertIn("hypothesis", text)
+        text, err = mind._mcp_dispatch(
+            "habit", {"action": "revise", "target": "1"})
+        self.assertTrue(err)
+        self.assertIn("keep/deprecate", text)
+        text, err = mind._mcp_dispatch("idea", {"action": "nope"})
+        self.assertTrue(err)
+
+    def serve(self, lines):
+        """Run cmd_serve against scripted stdin, return {id: msg}."""
+        stdin = io.StringIO("".join(json.dumps(m) + "\n" for m in lines))
+        stdout = io.StringIO()
+        old = sys.stdin, sys.stdout
+        sys.stdin, sys.stdout = stdin, stdout
+        try:
+            rc = mind.cmd_serve(None)
+        finally:
+            sys.stdin, sys.stdout = old
+        out = {}
+        for line in stdout.getvalue().splitlines():
+            o = json.loads(line)
+            out[o.get("id")] = o
+        return rc, out
+
+    def test_serve_initialize_and_tools_list(self):
+        rc, out = self.serve([
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": "2024-11-05"}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 3, "method": "ping"},
+        ])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out[1]["result"]["protocolVersion"], "2024-11-05")
+        self.assertEqual(out[1]["result"]["serverInfo"]["name"], "mind")
+        names = {t["name"] for t in out[2]["result"]["tools"]}
+        self.assertEqual(names, self.EXPECTED)
+        self.assertEqual(out[3]["result"], {})
+        # notification must not produce a response with id None
+        self.assertNotIn(None, out)
+
+    def test_serve_tools_call_and_errors(self):
+        self.make_insight("i1", summary="serve probe")
+        self.sync()
+        rc, out = self.serve([
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "recall", "arguments": {"query": "i1"}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "recall", "arguments": {}}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+             "params": "not-an-object"},
+            {"jsonrpc": "2.0", "id": 4, "method": "nope/method"},
+            {"jsonrpc": "2.0", "id": 5, "method": None},
+            {"jsonrpc": "2.0", "id": 6},
+        ])
+        self.assertEqual(rc, 0)
+        r = out[1]["result"]
+        self.assertFalse(r["isError"])
+        self.assertIn("i1", r["content"][0]["text"])
+        self.assertTrue(out[2]["result"]["isError"])
+        self.assertEqual(out[3]["error"]["code"], -32602)
+        self.assertEqual(out[4]["error"]["code"], -32601)
+        self.assertEqual(out[5]["error"]["code"], -32600)
+        self.assertEqual(out[6]["error"]["code"], -32600)
+
+    def test_serve_rejects_non_object_and_bad_json(self):
+        stdin = io.StringIO("[1,2,3]\n{broken\n")
+        stdout = io.StringIO()
+        old = sys.stdin, sys.stdout
+        sys.stdin, sys.stdout = stdin, stdout
+        try:
+            rc = mind.cmd_serve(None)
+        finally:
+            sys.stdin, sys.stdout = old
+        self.assertEqual(rc, 0)
+        codes = [json.loads(l)["error"]["code"]
+                 for l in stdout.getvalue().splitlines()]
+        self.assertEqual(codes, [-32600, -32700])
+
+
 if __name__ == "__main__":
     unittest.main()

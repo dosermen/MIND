@@ -176,15 +176,20 @@ python mind.py profile [--scope S] [--json]
 python mind.py digest [--json]
 python mind.py doctor mem [--json] [--deep]
 python mind.py veto ACTION [--list] [--json]   # хард-veto правила, см. §2
+python mind.py serve                            # MCP stdio-сервер, см. §8а
 ```
 
-Режимы вне v0 (НЕ реализуются, не регистрируются): `serve, reflect, resurrect, embed`.
+Режимы вне v0 (НЕ реализуются, не регистрируются): `reflect, resurrect`.
+(`serve` и `embed` — вне v0, но реализованы в slice 1 / 1.5, см. §8а и §13.)
 
 Коды возврата: 0 — ок; 1 — drift/валидация/ничего не найдено; 2 — ошибка/недоступен mem (doctor).
 
 `--file` может содержать frontmatter целиком: заданные значения побеждают,
 недостающие обязательные берутся из флагов; тип-поля валидируются. Иначе — TEXT-аргумент
 (ровно один источник: TEXT или --file, как в mem; rc=2 при обоих/ни одного).
+TEXT, начинающийся с `---`, тоже парсится как frontmatter+тело (slice 1: у MCP-клиента
+нет этики временных файлов, а все типы структурированы — голое тело всегда падает бы
+по валидации); голый тело TEXT вставляет как тело, как раньше.
 Исключения: `update --file` не принимает `id, version, supersedes, updated, path, type`
 (операционная идентичность — из самой записи), а `remember`/`idea new` не могут создать
 idea/habit/trait сразу в не-entry статусе (idea: `spark`, habit/trait: `candidate`) — это
@@ -265,6 +270,26 @@ digest-секция `recalc_pending` («N×side → предложи value±0.1�
 - Футеры честные: `hybrid` / `hybrid partial k/n` / `fts (no vectors yet)` /
   `fts (remote server down)` (телефон мёртв — молча отдаём FTS, как mem).
 - Дефолт остаётся чистым FTS до A/B-гейта (§13): без замера гибрид не включается.
+
+### MCP serve (slice 1) — `python mind.py serve`
+
+- Новая-строка JSON-RPC 2.0 поверх stdio, тот же shape, что `mem.py serve`
+  (protocol `2024-11-05`): `initialize` (serverInfo `mind`), `ping`,
+  `tools/list`, `tools/call`, `notifications/*` — без ответа; мусор
+  (не-объект, битый JSON, нет method) -> -32600/-32700, не падение.
+- Инструменты (13): `recall profile digest show list note remember update
+  forget restore veto idea habit` — всё read-only ядро + запись, кроме
+  `sync/embed/link/doctor` (служебные, только CLI). Mutating-тулзы берут
+  `MindLock`, как в CLI (единый mutating-набор `MUTATING`).
+- Диспетчер строит argparse-Namespace и зовёт те же `cmd_*` — одна
+  кодовая база, не копия логики; stdout перехватывается в текст ответа,
+  rc != 0 -> `isError: true`. Исключение инструмента -> текст ошибки,
+  сервер живёт (одна упавшая команда не убивает сессию).
+- Root-изоляция: `find_root()` -> фолбэк `HERE` (скрипт и есть MIND), так
+  что cwd opencode (чужой проект) не уводит сервер в чужое хранилище.
+- TEXT `remember`/`update`, начинающийся с `---`, парсится как
+  frontmatter+тело (см. §5) — иначе MCP-клиент не мог бы создать ни один
+  тип: все структурированы, голое тело всегда падает по валидации.
 
 ## 9. profile и digest
 
@@ -366,7 +391,9 @@ class MemBridge:
 
 ## 13. Вне v0 (дорожная карта)
 
-slice 1: MCP `serve` mind + тул `profile` в opencode.jsonc.
+slice 1: MCP `serve` mind + тул `profile` в opencode.jsonc. **Реализовано 26.11**
+  (секция «MCP serve» в §8): 13 тулов, тот же диспетчер на cmd_*, `MIND_ROOT`
+  изолирован фолбэком HERE; подключение в opencode.jsonc — следующий шаг.
 slice 1.5: embed — гибридный recall. **Реализовано 26.11** (секция «Гибрид» в §8):
   - Каскад ТОЛЬКО remote (телефон 5131 через `adb forward tcp:5031 tcp:5131`) → FTS,
     как в mem; локальный embed-server НЕ поднимать (правило AGENTS.md). Телефон
