@@ -1,0 +1,146 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 870" font-family="Segoe UI, Arial, sans-serif">
+  <defs>
+    <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 Z" fill="#334155"/>
+    </marker>
+    <marker id="arg" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 Z" fill="#94a3b8"/>
+    </marker>
+    <marker id="aro" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 Z" fill="#b45309"/>
+    </marker>
+  </defs>
+
+  <rect width="1200" height="870" fill="#f8fafc"/>
+  <text x="20" y="32" font-size="20" font-weight="bold" fill="#0f172a">MIND — как всё работает (slice 0 + note + embed, 26.11.2026)</text>
+  <text x="20" y="52" font-size="12.5" fill="#64748b">md = источник истины, mind.db = производный индекс; агент не может сам себе санкционировать (красная рамка = гейт); гибрид recall — opt-in до A/B-гейта</text>
+
+  <!-- ===== column headers ===== -->
+  <text x="20" y="84" font-size="13.5" font-weight="bold" fill="#7c3aed" letter-spacing="1">ИСТОЧНИКИ</text>
+  <text x="310" y="84" font-size="13.5" font-weight="bold" fill="#0f172a" letter-spacing="1">MIND (mind.py) — гейты и запись</text>
+  <text x="800" y="84" font-size="13.5" font-weight="bold" fill="#2563eb" letter-spacing="1">ПОТРЕБИТЕЛИ</text>
+
+  <!-- ===== A: sources ===== -->
+  <rect x="20" y="95" width="250" height="66" rx="8" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.5"/>
+  <text x="34" y="121" font-size="13.5" font-weight="bold" fill="#0f172a">Калибровка пользователя</text>
+  <text x="34" y="143" font-size="12" fill="#475569">20 развилок A/B/C → стартовые value</text>
+
+  <rect x="20" y="175" width="250" height="60" rx="8" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.5"/>
+  <text x="34" y="200" font-size="13.5" font-weight="bold" fill="#0f172a">Явное «да»</text>
+  <text x="34" y="221" font-size="12" fill="#475569">approve кандидата (и только он)</text>
+
+  <rect x="20" y="249" width="250" height="66" rx="8" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.5"/>
+  <text x="34" y="275" font-size="13.5" font-weight="bold" fill="#0f172a">Наблюдения агента</text>
+  <text x="34" y="297" font-size="12" fill="#475569">замер, вердикт, реплика пользователя</text>
+
+  <!-- ===== B: input gates ===== -->
+  <rect x="310" y="95" width="430" height="64" rx="8" fill="#fef2f2" stroke="#dc2626" stroke-width="2"/>
+  <text x="324" y="121" font-size="13.5" font-weight="bold" fill="#0f172a">remember --type trait / --file</text>
+  <text x="324" y="143" font-size="12" fill="#b91c1c">ГЕЙТ: только candidate — агент не активирует черту сам</text>
+
+  <rect x="310" y="171" width="430" height="64" rx="8" fill="#fef2f2" stroke="#dc2626" stroke-width="2"/>
+  <text x="324" y="197" font-size="13.5" font-weight="bold" fill="#0f172a">trait approve ID / habit approve ID</text>
+  <text x="324" y="219" font-size="12" fill="#b91c1c">candidate → active, approved_by=user; update-обход закрыт</text>
+
+  <rect x="310" y="247" width="430" height="64" rx="8" fill="#fff7ed" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="324" y="273" font-size="13.5" font-weight="bold" fill="#0f172a">note ID TEXT [--side up|down]</text>
+  <text x="324" y="295" font-size="12" fill="#475569">in-place: версия не бампается; notes ищутся в recall</text>
+
+  <rect x="310" y="323" width="430" height="78" rx="8" fill="#fff7ed" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="324" y="348" font-size="13.5" font-weight="bold" fill="#0f172a">update (пересчёт value по правилу)</text>
+  <text x="324" y="370" font-size="12" fill="#475569">против факта → сразу ±0.1; digest-recalc (2×side) → ±0.1</text>
+  <text x="324" y="390" font-size="12" fill="#475569">falsified_when → в той же сессии; смена value очищает notes</text>
+
+  <rect x="310" y="413" width="430" height="52" rx="8" fill="#fff7ed" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="324" y="436" font-size="13.5" font-weight="bold" fill="#0f172a">lifecycle-команды</text>
+  <text x="324" y="456" font-size="12" fill="#475569">idea status / idea kill / habit revise (версию не бампят)</text>
+
+  <!-- ===== C: store ===== -->
+  <rect x="310" y="490" width="430" height="60" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="2"/>
+  <text x="324" y="516" font-size="13.5" font-weight="bold" fill="#0f172a">MIND/*.md — источник истины</text>
+  <text x="324" y="538" font-size="12" fill="#475569">frontmatter + тело (notes, value, status); трекаются в git</text>
+
+  <rect x="310" y="575" width="430" height="68" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="2"/>
+  <text x="324" y="601" font-size="13.5" font-weight="bold" fill="#0f172a">sync → mind.db + MIND.md</text>
+  <text x="324" y="623" font-size="12" fill="#475569">FTS + mind_vec (вектора) — производные, в git НЕ живут</text>
+
+  <!-- ===== D: consumers ===== -->
+  <rect x="800" y="95" width="380" height="64" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="814" y="121" font-size="13.5" font-weight="bold" fill="#0f172a">profile — я-блок в контексте</text>
+  <text x="814" y="143" font-size="12" fill="#475569">только active; печатает исполнителя вето и hard-veto</text>
+
+  <rect x="800" y="171" width="380" height="64" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="814" y="197" font-size="13.5" font-weight="bold" fill="#0f172a">digest — pending одним списком</text>
+  <text x="814" y="219" font-size="12" fill="#475569">кандидаты, recalc_pending (2×side), WIP, expires</text>
+
+  <rect x="800" y="247" width="380" height="78" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="814" y="273" font-size="13.5" font-weight="bold" fill="#0f172a">recall — FTS, гибрид opt-in</text>
+  <text x="814" y="295" font-size="12" fill="#475569">fts: 0.60·bm25 + 0.25·recency + 0.15·imp</text>
+  <text x="814" y="315" font-size="12" fill="#475569">MIND_RECALL=hybrid: + 0.25·cosine (телефон)</text>
+
+  <rect x="800" y="337" width="380" height="92" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="814" y="362" font-size="13.5" font-weight="bold" fill="#0f172a">veto --list --json → плагин mind-veto</text>
+  <text x="814" y="385" font-size="12" fill="#475569">permission hook в opencode: block → deny,</text>
+  <text x="814" y="405" font-size="12" fill="#475569">hint → ask; fail-open; logs/veto-hook.log</text>
+  <text x="814" y="423" font-size="11.5" fill="#64748b">политика seed: hint + executor none (пока)</text>
+
+  <!-- ===== E: external ===== -->
+  <rect x="20" y="700" width="560" height="64" rx="8" fill="#f8fafc" stroke="#64748b" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="34" y="726" font-size="13.5" font-weight="bold" fill="#0f172a">mem — только чтение</text>
+  <text x="34" y="748" font-size="12" fill="#475569">mem-bridge → CONTRACT.json (9 tools); related_mem — цитаты</text>
+
+  <rect x="610" y="700" width="570" height="64" rx="8" fill="#f8fafc" stroke="#64748b" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="624" y="726" font-size="13.5" font-weight="bold" fill="#0f172a">Embedding: телефон (5031)</text>
+  <text x="624" y="748" font-size="12" fill="#475569">adb forward; локальный embed-server НЕ поднимается</text>
+
+  <!-- ===== arrows: A -> B ===== -->
+  <g stroke="#334155" stroke-width="1.6" fill="none">
+    <line x1="270" y1="128" x2="306" y2="127" marker-end="url(#ar)"/>
+    <line x1="270" y1="205" x2="306" y2="203" marker-end="url(#ar)"/>
+    <line x1="270" y1="282" x2="306" y2="279" marker-end="url(#ar)"/>
+  </g>
+
+  <!-- ===== bus: B -> C1 (left rail) ===== -->
+  <g stroke="#334155" stroke-width="1.6" fill="none">
+    <path d="M310 127 H292 V520 H306" marker-end="url(#ar)"/>
+    <path d="M310 203 H292"/>
+    <path d="M310 279 H292"/>
+    <path d="M310 362 H292 V520"/>
+    <path d="M310 439 H292 V520"/>
+  </g>
+
+  <!-- note -> update: the recalc loop -->
+  <line x1="525" y1="311" x2="525" y2="319" stroke="#b45309" stroke-width="2" marker-end="url(#aro)"/>
+  <text x="536" y="318" font-size="11" fill="#b45309" font-weight="bold">digest: 2×side → recalc ±0.1</text>
+
+  <!-- C1 -> C2 -->
+  <line x1="525" y1="550" x2="525" y2="571" stroke="#16a34a" stroke-width="1.8" marker-end="url(#ar)"/>
+  <text x="534" y="565" font-size="11.5" fill="#16a34a" font-weight="bold">sync</text>
+
+  <!-- ===== bus: C2 -> D (right rail) ===== -->
+  <g stroke="#334155" stroke-width="1.6" fill="none">
+    <path d="M740 609 H772 V127 H796" marker-end="url(#ar)"/>
+    <path d="M772 203 H796" marker-end="url(#ar)"/>
+    <path d="M772 286 H796" marker-end="url(#ar)"/>
+    <path d="M772 383 H796" marker-end="url(#ar)"/>
+  </g>
+
+  <!-- C2 -> E (dashed) -->
+  <g stroke="#94a3b8" stroke-width="1.5" fill="none" stroke-dasharray="6 5">
+    <path d="M430 643 V670 H300 V696" marker-end="url(#arg)"/>
+    <path d="M560 643 V670 H895 V696" marker-end="url(#arg)"/>
+  </g>
+  <text x="305" y="665" font-size="11" fill="#64748b">цитаты related_mem</text>
+  <text x="565" y="665" font-size="11" fill="#64748b">embed: текст →, вектора ← mind_vec</text>
+
+  <!-- ===== legend ===== -->
+  <line x1="20" y1="790" x2="1180" y2="790" stroke="#e2e8f0" stroke-width="1"/>
+  <g font-size="12.5" fill="#475569">
+    <text x="20" y="814">→ поток данных</text>
+    <text x="150" y="814">▬ красная = гейт (агент не санкционирует сам)</text>
+    <text x="490" y="814">▬ оранжевое = note/recalc-петля</text>
+    <text x="760" y="814">▬ зелёное = хранилище (md — истина)</text>
+    <text x="1030" y="814">▬ пунктир = внешняя связь</text>
+    <text x="20" y="838">Петля пересчёта: note (2×side) → digest recalc_pending → update ±0.1 → новая версия md → sync → profile видит новый value. Embed по sig: изменённый текст переэмбедивается, мёртвый телефон = FTS. Решения (approve, калибровка) — всегда за пользователем.</text>
+  </g>
+</svg>
