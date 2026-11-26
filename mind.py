@@ -2459,10 +2459,30 @@ def _mem_contract(root, timeout=20.0, deep=False):
                 br.timeout = min(br.timeout, left())
                 hits = br.recall("test", limit=3)
                 out["deep_hits"] = [h["citation"] for h in hits]
+                # citation shape comes from the contract pin, not from a
+                # second hardcoded regex (audit 2.2.2); CITATION_RE only
+                # backstops a contract that does not pin a pattern
+                pat = contract.get("citation_pattern")
+                try:
+                    cre = re.compile(pat) if isinstance(pat, str) and pat \
+                        else CITATION_RE
+                except re.error:
+                    cre = CITATION_RE  # check_contract already reported it
                 for h in hits:
-                    if not CITATION_RE.match(h["citation"]):
+                    if not cre.match(h["citation"]):
                         report["drifts"].append(
                             f"bad citation shape: {h['citation']!r}")
+                        report["ok"] = False
+                        out["state"] = "drift"
+                # frontmatter_required against a live record: the contract
+                # claims mem records carry these fields - verify one
+                # (audit 2.2.2)
+                if hits:
+                    br.timeout = min(br.timeout, left())
+                    sample = br.show(hits[0]["citation"])
+                    for d in getattr(mod, "check_contract_fields",
+                                     lambda c, t: [])(contract, sample):
+                        report["drifts"].append(d)
                         report["ok"] = False
                         out["state"] = "drift"
             except Exception as e:

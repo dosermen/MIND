@@ -44,8 +44,40 @@ _RECALL_HDR = re.compile(
 _RECALL_FOOTER = re.compile(r"^-- \d+/\d+ hits\b")
 _RELATED_LINE = re.compile(r"^\[related (->|<-)")
 
+# mem cmd_show header (mem.py:2047): "76@v3 [active] semantic path
+# (2026-11-25, imp 5, author opencode)" - the only place mem exposes the
+# record's frontmatter fields, so it is what frontmatter_required checks.
+_SHOW_HDR = re.compile(
+    r"^(\d+)@v(\d+) \[([^\]]*)\] (\S+) (.+?) \(([^,]+), imp \d+, "
+    r"author (.*)\)\s*$")
+
 # tools the bridge may call: READ-ONLY by contract (DESIGN.md section 10)
 _READ_TOOLS = frozenset({"recall", "search", "list", "show"})
+
+
+def check_contract_fields(contract, record_text):
+    """-> drift strings: does a mem `show` answer carry every field the
+    contract pins in frontmatter_required? (audit 2.2.2: the key was in
+    CONTRACT.json but nothing ever checked it)
+
+    record_text=None or an unparseable header yields no drift here - the
+    caller decides whether a missing sample is worth reporting; a header
+    that parses but has empty/absent fields is real drift.
+    """
+    req = contract.get("frontmatter_required")
+    if not record_text or not isinstance(req, list) or not req:
+        return []
+    m = _SHOW_HDR.match(record_text.splitlines()[0] if record_text else "")
+    if not m:
+        return []  # format check is the caller's business (deep probe)
+    hdr = {"version": m.group(2), "status": m.group(3), "type": m.group(4),
+           "path": m.group(5), "updated": m.group(6), "author": m.group(7)}
+    missing = [k for k in req
+               if not str(hdr.get(k, "")).strip()]
+    if missing:
+        return ["frontmatter_required empty/absent in mem show: "
+                + ", ".join(missing)]
+    return []
 
 
 class MemBridge:
@@ -310,6 +342,23 @@ class MemBridge:
             drifts.append("tools added: " + ", ".join(added))
         if missing:
             drifts.append("tools missing: " + ", ".join(missing))
+        # the two descriptive keys must be checkable too, not decorative
+        # (audit 2.2.2: "drift -> warning, never silent")
+        pat = contract.get("citation_pattern")
+        if pat is not None:
+            if not isinstance(pat, str) or not pat:
+                drifts.append("citation_pattern: empty or not a string")
+            else:
+                try:
+                    re.compile(pat)
+                except re.error as e:
+                    drifts.append(f"citation_pattern does not compile: {e}")
+        req = contract.get("frontmatter_required")
+        if req is not None and (
+                not isinstance(req, list) or not req
+                or not all(isinstance(k, str) and k for k in req)):
+            drifts.append("frontmatter_required: expected a non-empty list "
+                          "of field names")
         return {"ok": not drifts, "drifts": drifts, "server": got,
                 "protocol": self.protocol_version, "tools": tools}
 

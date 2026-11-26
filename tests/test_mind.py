@@ -1070,6 +1070,79 @@ class TestBridgeParse(unittest.TestCase):
             [])
 
 
+class TestContractFields(Base):
+    """audit 2.2.2: citation_pattern / frontmatter_required must be
+    checked, not decorative."""
+
+    GOOD_SHOW = ("76@v3 [active] semantic inkling2-mini-recon-v3 "
+                 "(2026-11-25, imp 5, author opencode)\n"
+                 "file: memory/semantic/x.md\n\nbody\n")
+
+    def test_check_contract_fields_ok(self):
+        mod = mind.load_bridge()
+        c = {"frontmatter_required": ["type", "path", "status", "version",
+                                      "author", "updated"]}
+        self.assertEqual(mod.check_contract_fields(c, self.GOOD_SHOW), [])
+
+    def test_check_contract_fields_missing_key(self):
+        mod = mind.load_bridge()
+        c = {"frontmatter_required": ["type", "bogus_field"]}
+        drifts = mod.check_contract_fields(c, self.GOOD_SHOW)
+        self.assertEqual(len(drifts), 1)
+        self.assertIn("bogus_field", drifts[0])
+
+    def test_check_contract_fields_ignores_no_sample(self):
+        mod = mind.load_bridge()
+        c = {"frontmatter_required": ["type"]}
+        self.assertEqual(mod.check_contract_fields(c, None), [])
+        self.assertEqual(mod.check_contract_fields(c, "not a header"), [])
+
+    def test_bad_citation_pattern_is_drift(self):
+        self.write_contract()
+        cp = self.root / "CONTRACT.json"
+        data = json.loads(cp.read_text(encoding="utf-8"))
+        data["citation_pattern"] = "[unclosed"
+        cp.write_text(json.dumps(data), encoding="utf-8")
+        rc, out = self.run_main("doctor", "mem")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("citation_pattern does not compile", out)
+
+    def test_bad_frontmatter_required_is_drift(self):
+        self.write_contract()
+        cp = self.root / "CONTRACT.json"
+        data = json.loads(cp.read_text(encoding="utf-8"))
+        data["frontmatter_required"] = "type,path"
+        cp.write_text(json.dumps(data), encoding="utf-8")
+        rc, out = self.run_main("doctor", "mem")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("frontmatter_required", out)
+
+    def test_deep_uses_contract_pattern_not_hardcoded(self):
+        # a contract pattern that rejects mem's real citation shape must
+        # surface as drift even though the hardcoded CITATION_RE matches
+        self.write_contract()
+        cp = self.root / "CONTRACT.json"
+        data = json.loads(cp.read_text(encoding="utf-8"))
+        data["citation_pattern"] = r"^x\d+$"
+        cp.write_text(json.dumps(data), encoding="utf-8")
+        rc, out = self.run_main("doctor", "mem", "--deep")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("bad citation shape", out)
+
+    def test_deep_frontmatter_drift_on_missing_field(self):
+        # stub show carries status/type/path/updated/author/version;
+        # a contract demanding an extra field must fail the deep probe
+        self.write_contract()
+        cp = self.root / "CONTRACT.json"
+        data = json.loads(cp.read_text(encoding="utf-8"))
+        data["frontmatter_required"] = ["type", "no_such_field"]
+        cp.write_text(json.dumps(data), encoding="utf-8")
+        rc, out = self.run_main("doctor", "mem", "--deep")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("frontmatter_required", out)
+        self.assertIn("no_such_field", out)
+
+
 # ---------------------------------------------------------------------------
 # P0 hardening tests (audit 26.11: resync, BOM, invariance, validation
 # matrix, idea gates matrix, bridge failure modes, real-mem integration)
