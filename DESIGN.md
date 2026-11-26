@@ -59,7 +59,22 @@ F:\AI\MIND\
 Опциональные тип-поля (примеры): у trait — `evidence_mem, evidence_mind, counter_evidence`;
 у habit — `eligibles, hits, exceptions, approved_by, approved_at, expires`;
 у idea — `expected, criterion, cost, preconditions, resurrected, killed_by, killed_at`;
-у insight — `falsifiable_by, reflected_on`; у setting — `block_conditions, override`.
+у insight — `falsifiable_by, reflected_on`; у setting — `block_conditions, override, veto_executor`.
+
+### veto-policy: кто исполняет mode (решение 26.11)
+
+`mode` описывает силу ЖЁСТКОЙ части; совет (hint) — отдельно.
+
+| mode | исполнитель | что это честно значит |
+|---|---|---|
+| `off` | никто | записи нет в силе: ни совета, ни вето |
+| `hint` | агент (LLM) | **совет**; гарантии нет, модель может промолчать |
+| `block` | `veto_executor: code\|hook` | вето механическое (код/хук вне модели) |
+
+Правило честности: `mode: block` без `veto_executor` (code|hook) — **ошибка валидации**
+(агент не может исполнить блок); `veto_executor` при mode != block — тоже ошибка.
+`block_conditions` — список непустых строк (что именно блокируется). `profile`/`digest`
+печатают исполнителя рядом с mode, чтобы «политика» не выглядела сильнее, чем есть.
 
 ## 3. Матрица статусов
 
@@ -179,14 +194,18 @@ candidate --approve--> active --revise--> deprecated
 
 `profile` — я-блок (~500 токенов), только alive:
 свежие черты (по scope), active-привычки (кандидаты НЕТ), <=3 свежих insight,
-счётчики parked/drafted/testing идей, текущий setting veto-policy.
+счётчики parked/drafted/testing идей, текущий setting veto-policy — с явным
+исполнителем (`advisory ... NOT enforced (executor: none)` для hint) и списком
+hard-veto условий.
 
 `digest` — pending одним списком (один раз в сутки, не размазано):
 1. candidate-привычки/черты, ждущие approve;
 2. идеи: WIP-список, drafted с criterion (готовы к testing), parked с истёкшими preconditions — нет;
 3. привычки: expires<=today или exceptions>=3;
 4. doctor mem: статус контракта (drift -> warn; mem down -> warn, не фатал);
-5. битые `related_mem`-цитаты (сверка показом через bridge, только при живом mem).
+5. битые `related_mem`-цитаты (сверка показом через bridge, только при живом mem);
+6. settings: mode + кто исполняет (`hint` -> `NOT enforced (executor: none)`),
+   сколько hard-veto условий висит без исполнителя.
 
 `--json` у обоих — структурированный вывод.
 
@@ -253,6 +272,7 @@ class MemBridge:
 |---|---|
 | mem недоступен | свои записи и recall работают; bridge-часть digest/doctor -> warn `mem bridge: DOWN (<detail>)`, rc!=0 только у doctor |
 | битая цитата | doctor/digest помечают, не чинят молча |
+| mode=block без veto_executor | ошибка валидации sync/remember (не молчим: вето негде исполнять) |
 | mind.db удалён/устарел | sync пересобирает из md (auto-resync, как ensure_fresh) |
 
 ## 12. Тесты

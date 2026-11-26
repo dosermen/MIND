@@ -482,8 +482,29 @@ def validate_record(fm, rel):
         if st == "lost" and not str(fm.get("killed_by") or "").strip():
             errors.append(f"{rel}: idea status=lost requires 'killed_by'")
     if typ == "setting":
-        if fm.get("mode") not in ("off", "hint", "block"):
+        mode = fm.get("mode")
+        if mode not in ("off", "hint", "block"):
             errors.append(f"{rel}: setting mode must be off|hint|block")
+        # honesty rule (user decision 26.11): 'block' must name an
+        # executor that lives OUTSIDE the model - otherwise the setting
+        # claims an enforcement that does not exist
+        if mode == "block":
+            ex = fm.get("veto_executor")
+            if ex not in ("code", "hook"):
+                errors.append(
+                    f"{rel}: mode 'block' requires veto_executor "
+                    f"code|hook (got {ex!r}); an LLM cannot enforce a "
+                    "block - use mode 'hint' for advisory only")
+        elif fm.get("veto_executor") not in (None, "", "none"):
+            errors.append(
+                f"{rel}: veto_executor={fm.get('veto_executor')!r} only "
+                "meaningful with mode 'block'")
+        bc = fm.get("block_conditions")
+        if bc is not None:
+            if not isinstance(bc, list):
+                errors.append(f"{rel}: block_conditions must be a list")
+            elif any(not str(x).strip() for x in bc):
+                errors.append(f"{rel}: block_conditions has an empty entry")
     for c in (fm.get("related_mem") or []) if isinstance(
             fm.get("related_mem"), list) else []:
         if c and not CITATION_RE.match(str(c)):
@@ -1785,7 +1806,11 @@ def cmd_profile(args):
         "idea_counts": counts,
         "parked_ideas": [{"id": r["id"], "path": r["path"]} for r in parked],
         "settings": [{"id": r["id"], "path": r["path"],
-                      "mode": json.loads(r["fm_json"]).get("mode")}
+                      "mode": json.loads(r["fm_json"]).get("mode"),
+                      "veto_executor": json.loads(r["fm_json"]).get(
+                          "veto_executor") or "none",
+                      "block_conditions": json.loads(r["fm_json"]).get(
+                          "block_conditions") or []}
                      for r in settings],
     }
     if args.json:
@@ -1815,8 +1840,19 @@ def cmd_profile(args):
     idea_bits = [f"{k} {v}" for k, v in sorted(counts.items())]
     print("ideas: " + (", ".join(idea_bits) if idea_bits else "none"))
     if prof["settings"]:
-        print("settings: " + ", ".join(
-            f"{s['path']}={s['mode']}" for s in prof["settings"]))
+        for s in prof["settings"]:
+            # honest label: who actually enforces this mode (user 26.11)
+            if s["mode"] == "off":
+                how = "no advice, no veto"
+            elif s["mode"] == "hint":
+                how = ("advisory: the agent advises, cannot enforce; "
+                       f"hard-veto list NOT enforced (executor: "
+                       f"{s['veto_executor']})")
+            else:
+                how = f"enforced by {s['veto_executor']}"
+            print(f"settings: {s['path']}={s['mode']} ({how})")
+            for c in s["block_conditions"]:
+                print(f"  - hard-veto condition: {c}")
     return 0
 
 
@@ -1990,6 +2026,21 @@ def cmd_digest(args):
             if reasons:
                 revision.append({"id": r["id"], "path": r["path"],
                                  "reasons": reasons})
+        # who enforces each setting (honest label, user 26.11): an
+        # advisory mode with a hard-veto list means nobody executes it
+        settings = []
+        for r in db.execute(
+                "SELECT * FROM memories WHERE type='setting' AND "
+                "status NOT IN ('superseded','deleted') ORDER BY path"):
+            try:
+                fm = json.loads(r["fm_json"] or "{}")
+            except (TypeError, ValueError):
+                fm = {}
+            settings.append({
+                "id": r["id"], "path": r["path"],
+                "mode": fm.get("mode"),
+                "executor": fm.get("veto_executor") or "none",
+                "conditions": len(fm.get("block_conditions") or [])})
     finally:
         db.close()
 
@@ -1999,6 +2050,7 @@ def cmd_digest(args):
             "ideas": {"wip": wip, "ready_for_testing": ready,
                       "parked": parked_n},
             "habit_revision": revision,
+            "settings": settings,
             "mem": {"state": mem["state"],
                     "detail": mem["detail"] or None,
                     "drifts": (mem["report"] or {}).get("drifts", [])},
@@ -2036,6 +2088,18 @@ def cmd_digest(args):
         print(f"5. broken citations: {', '.join(broken)}")
     else:
         print("5. broken citations: none")
+    if settings:
+        print(f"6. settings ({len(settings)})")
+        for s in settings:
+            if s["mode"] == "hint":
+                state = (f"advisory, hard-veto {s['conditions']} "
+                         f"NOT enforced (executor: {s['executor']})")
+            elif s["mode"] == "block":
+                state = (f"enforced by {s['executor']}, "
+                         f"hard-veto {s['conditions']}")
+            else:
+                state = "off: no advice, no veto"
+            print(f"   {s['path']}={s['mode']} ({state})")
     return 0
 
 

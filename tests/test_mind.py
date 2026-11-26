@@ -1144,6 +1144,63 @@ class TestP0ReviewFixes(Base):
         self.assertFalse((self.root / "mind.lock").exists())
 
 
+class TestVetoHonesty(Base):
+    """User decision 26.11: a mode must name an executor that can enforce it."""
+
+    def setting(self, name, extra):
+        self.write_record("setting", name, extra)
+        return self.sync()
+
+    def test_block_without_executor_rejected(self):
+        rc, out = self.setting("v1", {"mode": "block"})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("requires veto_executor", out)
+
+    def test_block_with_code_executor_ok(self):
+        rc, out = self.setting("v2", {"mode": "block",
+                                      "veto_executor": "code"})
+        self.assertEqual(rc, 0, out)
+
+    def test_executor_only_meaningful_with_block(self):
+        rc, out = self.setting("v3", {"mode": "hint",
+                                      "veto_executor": "code"})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("only meaningful with mode 'block'", out)
+
+    def test_hint_with_none_executor_ok(self):
+        rc, out = self.setting("v4", {"mode": "hint",
+                                      "veto_executor": "none",
+                                      "block_conditions": ["push github"]})
+        self.assertEqual(rc, 0, out)
+
+    def test_block_conditions_must_be_list(self):
+        rc, out = self.setting("v5", {"mode": "hint",
+                                      "block_conditions": "push github"})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("block_conditions must be a list", out)
+
+    def test_profile_labels_advisory_honestly(self):
+        rc, out = self.setting("veto", {"mode": "hint",
+                                        "block_conditions": ["push github",
+                                                             "shutdown pc"]})
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_main("profile")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("veto=hint", out)
+        self.assertIn("NOT enforced", out)
+        self.assertIn("executor: none", out)
+        self.assertIn("hard-veto condition: push github", out)
+
+    def test_digest_reports_executor_state(self):
+        self.setting("veto", {"mode": "hint",
+                              "block_conditions": ["push github"]})
+        rc, out = self.run_main("digest")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("6. settings (1)", out)
+        self.assertIn("veto=hint", out)
+        self.assertIn("NOT enforced", out)
+
+
 REAL_MEM = Path(r"F:\AI\OLAMA\tools\mem.py")
 
 

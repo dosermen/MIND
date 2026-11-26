@@ -9,6 +9,7 @@ importance: 5
 confidence: 1.0
 scope: all
 mode: hint
+veto_executor: none
 hint_style: suggest + explain
 block_conditions: [push to GitHub without explicit yes (ban per AGENTS.md), "permanently forbidden flags (GGML_VK_ALLOW_GRAPHICS_QUEUE, GGML_VK_DISABLE_INTEGER_DOT_PRODUCT, GGML_VK_FA_SPARSE_DISABLE)", PC shutdown / keeper 5023 without instruction]
 override: user can override any block with an explicit no
