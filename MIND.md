@@ -1,5 +1,5 @@
 # MIND.md - index
-generated: 2026-11-25 14:13:25
+generated: 2026-11-26 07:21:59
 
 ## habit (1)
 - **defrag-after-download** 1@v1 [active] (2026-11-25) imp4

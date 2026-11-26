@@ -17,6 +17,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 import traceback
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -65,6 +66,16 @@ RECALL_LIMIT = 10
 RECALL_BUDGET = 6000
 RECENCY_DAYS = 30.0
 W_BM25, W_REC, W_IMP = 0.60, 0.25, 0.15
+
+# per-type default status: a blind "active" is invalid for idea/trait/habit
+# (review: remember --type idea always failed on the default)
+DEFAULT_STATUS = {
+    "trait": "candidate",
+    "habit": "candidate",
+    "idea": "spark",
+    "insight": "active",
+    "setting": "active",
+}
 
 PREVIEW_FIELDS = {
     "trait": ("value", "direction"),
@@ -289,28 +300,133 @@ def open_db(root):
     return db
 
 
-def _newest_md_mtime(root):
+LOCK_STALE_SECONDS = 300
+
+# in-process reentrancy: mutations hold the lock via main(), while
+# ensure_index/_run_sync called from READ commands must take it too
+# (review M1: reads rebuilt the store with no lock at all)
+_LOCK_HELD = False
+
+
+class MindLock:
+    """Single-writer lock for mutations (review MED).
+
+    md stays the source of truth, but two concurrent writers racing on
+    write_md + full rebuild can interleave into a torn index. Advisory
+    lockfile next to mind.db; a lock older than LOCK_STALE_SECONDS is
+    stolen (crashed writer). Reentrant within this process: nested
+    acquisitions (mutation -> _run_sync) are no-ops.
+    """
+
+    def __init__(self, root):
+        self.path = Path(root) / "mind.lock"
+        self.acquired = False
+
+    def __enter__(self):
+        global _LOCK_HELD
+        if _LOCK_HELD:
+            return self  # reentrant: outermost holder owns the file
+        for _ in range(2):
+            try:
+                fd = os.open(str(self.path),
+                             os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode("ascii"))
+                os.close(fd)
+                self.acquired = True
+                _LOCK_HELD = True
+                return self
+            except FileExistsError:
+                try:
+                    age = time.time() - self.path.stat().st_mtime
+                except OSError:
+                    continue  # vanished, retry the create
+                if age > LOCK_STALE_SECONDS:
+                    # steal atomically: rename wins for exactly one
+                    # contender; a loser gets OSError -> retry (review m2)
+                    try:
+                        os.replace(str(self.path),
+                                   str(self.path) + ".stale")
+                        (Path(str(self.path) + ".stale")).unlink()
+                    except OSError:
+                        pass
+                    continue  # retry create once
+                raise RuntimeError(
+                    f"another mind writer holds {self.path.name} "
+                    f"({int(age)}s old)")
+        raise RuntimeError(f"cannot acquire {self.path.name}")
+
+    def __exit__(self, *exc):
+        global _LOCK_HELD
+        if self.acquired:
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
+            self.acquired = False
+            _LOCK_HELD = False
+        return False
+
+
+def _md_facts(root):
+    """-> (newest_mtime, file_count, total_bytes); (None, 0, 0) if absent."""
     md_dir = root / "MIND"
     if not md_dir.is_dir():
-        return None  # no source dir at all
-    newest = 0.0
+        return None, 0, 0
+    newest, count, size = 0.0, 0, 0
     for f in md_dir.rglob("*.md"):
+        count += 1
         try:
-            newest = max(newest, f.stat().st_mtime)
+            st = f.stat()
+            newest = max(newest, st.st_mtime)
+            size += st.st_size
         except OSError:
             pass
-    return newest
+    return newest, count, size
 
 
 def ensure_index(root):
-    """Auto-resync when db is missing or any md is newer (drift)."""
+    """Auto-resync on drift: missing db, newer md, OR deleted md.
+
+    mtime alone cannot see a manual deletion (review MED): the file is
+    gone, every remaining mtime is older than the db. Both facts (count
+    and newest mtime) are stamped into meta at each sync and compared
+    exactly - no fudge window (audit: writes <1 ms after the rebuild
+    used to slip through the old +0.001 tolerance).
+    """
     db_path = root / "mind.db"
-    if not db_path.is_file():
-        _run_sync(root, lenient=True, quiet=True)
-        return
-    newest = _newest_md_mtime(root)
-    if newest is None or newest > db_path.stat().st_mtime + 0.001:
-        _run_sync(root, lenient=True, quiet=True)
+    # a READ command rebuilding the store is still a writer (review M1):
+    # take the same lock mutations use; reentrant when we already hold it
+    with MindLock(root):
+        if not db_path.is_file():
+            _run_sync(root, lenient=True, quiet=True)
+            return
+        newest, count, size = _md_facts(root)
+        stored_count = stored_newest = stored_size = None
+        try:
+            db = open_db(root)
+            try:
+                row = db.execute(
+                    "SELECT k, v FROM meta WHERE k IN ('md_count',"
+                    " 'md_newest', 'md_size')").fetchall()
+                vals = {r["k"]: r["v"] for r in row}
+                stored_count = int(vals["md_count"]) if "md_count" in vals \
+                    else None
+                stored_newest = float(vals["md_newest"]) \
+                    if "md_newest" in vals else None
+                stored_size = int(vals["md_size"]) if "md_size" in vals \
+                    else None
+            finally:
+                db.close()
+        except (sqlite3.Error, OSError, TypeError, ValueError):
+            stored_count = stored_newest = stored_size = None
+        drifted = (
+            stored_count is None or stored_count != count
+            or stored_newest is None
+            or (newest if newest is not None else 0.0) != stored_newest
+            or stored_size is None or stored_size != size
+        )
+        if drifted:
+            _run_sync(root, lenient=True, quiet=True)
 
 
 # ---------------------------------------------------------------------------
@@ -415,8 +531,42 @@ def write_index(db, root):
                          f"[{r['status']}] ({r['updated_at']}) "
                          f"imp{r['importance']}")
         lines.append("")
-    (root / "MIND.md").write_text("\n".join(lines) + "\n",
-                                  encoding="utf-8")
+    # atomic like write_md (review m3): a kill mid-write must not leave
+    # a torn MIND.md
+    out = "\n".join(lines) + "\n"
+    tmp = root / "MIND.md.tmp"
+    tmp.write_text(out, encoding="utf-8")
+    os.replace(str(tmp), str(root / "MIND.md"))
+
+
+def _lossy_fm(text):
+    """Frontmatter constructs this parser cannot roundtrip (review m4).
+
+    Indented non-dash lines and block scalars are silently DROPPED by
+    _parse_yaml; stamping such a file back would destroy the data. -> []
+    when safe to rewrite.
+    """
+    m = re.match(r"^---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|$)",
+                 text, re.S)
+    if not m:
+        return []
+    bad = []
+    for i, raw in enumerate(m.group(1).splitlines(), 1):
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        s = raw.strip()
+        if raw[0] in (" ", "\t"):
+            if s == "-" or s.startswith("- "):
+                continue      # list item
+            bad.append(f"indented line {i} (continuation/block scalar)")
+            continue
+        if ":" not in raw:
+            bad.append(f"line {i} without ':' (dropped by parser)")
+            continue
+        v = raw.partition(":")[2].strip()
+        if re.fullmatch(r"[|>][-+]?\d*", v):
+            bad.append(f"line {i} block scalar {v!r}")
+    return bad
 
 
 def _run_sync(root, lenient=False, quiet=False):
@@ -426,16 +576,34 @@ def _run_sync(root, lenient=False, quiet=False):
     today = date.today().isoformat()
     entries = []          # (file, fm, body, rel, id)
     seen = {}             # id -> rel
+    claimed = set()       # EVERY fm id seen, incl. records failing later
     pending = []          # (file, fm, body, rel) without id yet
+    lossy = {}            # file -> constructs that would be dropped
 
     for f in files:
         rel = f.relative_to(md_dir).as_posix()
         try:
-            text = f.read_text(encoding="utf-8")
-        except OSError as e:
+            # utf-8-sig: a BOM must not make the record unparseable
+            # (audit: BOM -> record silently lost with rc=0); a broken
+            # byte sequence must not lock out the whole store either.
+            text = f.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError) as e:
             errors.append(f"{rel}: read failed: {e}")
             continue
+        lost = _lossy_fm(text)
+        if lost:
+            lossy[f] = lost
+            errors.append(f"{rel}: unsupported frontmatter "
+                          f"({'; '.join(lost)}) - NOT rewritten, "
+                          "fix by hand")
         fm, body = parse_frontmatter(text)
+        # reserve the id BEFORE any validation skip: a broken max-id file
+        # must not lose its id to a new record (review: id theft)
+        if fm.get("id") not in (None, ""):
+            try:
+                claimed.add(int(fm["id"]))
+            except (TypeError, ValueError):
+                pass  # bad id is reported below by the id check
         typ = fm.get("type")
         if typ not in TYPES:
             errors.append(f"{rel}: missing/unknown type {typ!r}")
@@ -444,7 +612,7 @@ def _run_sync(root, lenient=False, quiet=False):
         if not fm.get("path"):
             fm["path"] = re.sub(r"-v\d+$", "", f.stem)
         if not fm.get("status"):
-            fm["status"] = "active"
+            fm["status"] = DEFAULT_STATUS.get(typ, "active")
         if fm.get("version") in (None, ""):
             m = re.search(r"-v(\d+)$", f.stem)
             fm["version"] = int(m.group(1)) if m else 1
@@ -496,26 +664,42 @@ def _run_sync(root, lenient=False, quiet=False):
         seen[fid] = rel
         entries.append((f, fm, body, rel, fid))
 
-    # assign ids to new/legacy files (sorted file order, max+1)
-    next_id = (max(seen) if seen else 0) + 1
+    # assign ids to new/legacy files (sorted file order, max+1 over ALL
+    # claimed ids AND the stored high-water mark - deleting the max-id
+    # file must not recycle its id, review M3)
+    max_id_floor = 0
+    db0 = open_db(root)
+    try:
+        row = db0.execute("SELECT v FROM meta WHERE k='md_max_id'"
+                          ).fetchone()
+        if row:
+            max_id_floor = int(row["v"])
+    except (sqlite3.Error, TypeError, ValueError):
+        max_id_floor = 0
+    finally:
+        db0.close()
+    next_id = max(max_id_floor, max(claimed) if claimed else 0) + 1
     assigned = 0
     for (f, fm, body, rel) in pending:
         fid = next_id
         next_id += 1
         fm["id"] = fid
         seen[fid] = rel
+        claimed.add(fid)
         entries.append((f, fm, body, rel, fid))
         assigned += 1
 
     # stamp frontmatter back (id/defaults/normalization)
     for (f, fm, body, rel, _fid) in entries:
+        if f in lossy:
+            continue          # rewriting would drop lines (see above)
         text = dump_frontmatter(fm)
         if body:
             text += body if body.endswith("\n") else body + "\n"
         try:
-            if f.read_text(encoding="utf-8") != text:
+            if f.read_text(encoding="utf-8-sig") != text:
                 write_md(f, fm, body)
-        except OSError as e:
+        except (OSError, UnicodeDecodeError) as e:
             errors.append(f"{rel}: stamp failed: {e}")
 
     # supersedes -> parent_id
@@ -536,6 +720,20 @@ def _run_sync(root, lenient=False, quiet=False):
             return by_path[s]
         return None
 
+    # facts over the SAME file snapshot entries were built from (fresh
+    # mtimes: stamping above just rewrote some of them) - a count/newest
+    # taken from a later rglob could disagree with the indexed set
+    newest, size = 0.0, 0
+    for f in files:
+        try:
+            st = f.stat()
+            newest = max(newest, st.st_mtime)
+            size += st.st_size
+        except OSError:
+            pass
+    count = len(files)
+    md_max_id = max(max_id_floor, max(claimed) if claimed else 0)
+
     # full rebuild of the derived index (md is the truth)
     db = open_db(root)
     try:
@@ -549,10 +747,11 @@ def _run_sync(root, lenient=False, quiet=False):
                     warns.append(f"{rel}: supersedes target not found: "
                                  f"{fm['supersedes']!r}")
             db.execute(
-                "INSERT INTO memories (id,file,path,type,status,content,body,"
-                "version,parent_id,importance,confidence,scope,author,"
-                "session,created_at,updated_at,related_mind,related_mem,"
-                "fm_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO memories (id,file,path,type,status,content,"
+                "body,version,parent_id,importance,confidence,scope,"
+                "author,session,created_at,updated_at,related_mind,"
+                "related_mem,fm_json) VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (fid, rel, str(fm.get("path") or ""), str(fm.get("type")),
                  str(fm.get("status")), _build_search_text(fm, body),
                  body or "", fm["version"], pid,
@@ -567,16 +766,28 @@ def _run_sync(root, lenient=False, quiet=False):
                             ensure_ascii=False),
                  json.dumps(fm, ensure_ascii=False)))
             db.execute("INSERT INTO memories_fts (rowid, search_text) "
-                       "VALUES (?,?)", (fid, _build_search_text(fm, body)))
+                       "VALUES (?,?)",
+                       (fid, _build_search_text(fm, body)))
+        # stamp source facts BEFORE commit: meta written after commit
+        # used to be rolled back on close (review C1) - drift detection
+        # was dead and every read command re-ran a full rebuild forever
+        db.execute("INSERT OR REPLACE INTO meta (k, v) VALUES "
+                   "('md_count', ?)", (str(count),))
+        db.execute("INSERT OR REPLACE INTO meta (k, v) VALUES "
+                   "('md_newest', ?)", (repr(newest or 0.0),))
+        db.execute("INSERT OR REPLACE INTO meta (k, v) VALUES "
+                   "('md_size', ?)", (str(size),))
+        db.execute("INSERT OR REPLACE INTO meta (k, v) VALUES "
+                   "('md_max_id', ?)", (str(md_max_id),))
         db.commit()
         write_index(db, root)
     finally:
         db.close()
 
     for w in warns:
-        print(f"WARN: {w}")
+        print(f"WARN: {w}", file=sys.stderr)
     for e in errors:
-        print(f"ERROR: {e}")
+        print(f"ERROR: {e}", file=sys.stderr)
     if not quiet:
         print(f"synced {len(entries)} records, {assigned} ids assigned, "
               f"{len(errors)} errors")
@@ -597,15 +808,23 @@ def _find_row(db, target):
     t = str(target).strip()
     m = re.fullmatch(r"(\d+)(?:@v(\d+))?", t)
     if m:
-        return db.execute("SELECT * FROM memories WHERE id=?",
-                          (int(m.group(1)),)).fetchone()
+        row = db.execute("SELECT * FROM memories WHERE id=?",
+                         (int(m.group(1)),)).fetchone()
+        # honor an explicit version: 1@v9 must not silently return v1
+        if row is not None and m.group(2) and \
+                int(row["version"]) != int(m.group(2)):
+            return None
+        return row
     t2 = t.replace("\\", "/")
+    esc = t2.replace("%", "\\%").replace("_", "\\_")  # wildcards are literal
     candidates = (
         ("SELECT * FROM memories WHERE file=?", t2),
         ("SELECT * FROM memories WHERE file=?", t2 + ".md"),
         ("SELECT * FROM memories WHERE path=?", t2),
-        ("SELECT * FROM memories WHERE file LIKE ?", "%/" + t2),
-        ("SELECT * FROM memories WHERE file LIKE ?", "%/" + t2 + ".md"),
+        ("SELECT * FROM memories WHERE file LIKE ? ESCAPE '\\'",
+         "%/" + esc),
+        ("SELECT * FROM memories WHERE file LIKE ? ESCAPE '\\'",
+         "%/" + esc + ".md"),
     )
     for sql, param in candidates:
         r = db.execute(sql, (param,)).fetchone()
@@ -627,7 +846,7 @@ def get_record(root, target):
     fpath = root / "MIND" / row["file"]
     if not fpath.is_file():
         return None
-    fm, body = parse_frontmatter(fpath.read_text(encoding="utf-8"))
+    fm, body = parse_frontmatter(fpath.read_text(encoding="utf-8-sig"))
     return {"row": row, "fm": fm, "body": body, "file": fpath,
             "rel": row["file"]}
 
@@ -635,7 +854,9 @@ def get_record(root, target):
 def save_record(root, rec, fm):
     """Write fm back in place (no version bump) + resync."""
     write_md(rec["file"], fm, rec["body"])
-    return _run_sync(root, lenient=False, quiet=True)
+    # lenient: the mutation already validated THIS record; a foreign
+    # broken file must not roll back the mutation (review: strict rc lie)
+    return _run_sync(root, lenient=True, quiet=True)
 
 
 def _split_csv(s):
@@ -707,12 +928,13 @@ def _citation_list(db, ids_json):
 
 
 def _print_validation(errs, warns, where):
+    # stderr: a WARN must never corrupt a --json stdout (review MED)
     for w in warns:
-        print(f"WARN: {w}")
+        print(f"WARN: {w}", file=sys.stderr)
     if errs:
-        print(f"{where}: validation failed:")
+        print(f"{where}: validation failed:", file=sys.stderr)
         for e in errs:
-            print(f"  - {e}")
+            print(f"  - {e}", file=sys.stderr)
         return False
     return True
 
@@ -728,8 +950,8 @@ def cmd_remember(args):
     root = find_root()
     if args.file:
         try:
-            raw = Path(args.file).read_text(encoding="utf-8")
-        except OSError as e:
+            raw = Path(args.file).read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError) as e:
             print(f"remember: cannot read {args.file}: {e}")
             return 2
         fm, body = parse_frontmatter(raw)
@@ -759,7 +981,17 @@ def cmd_remember(args):
             return 1
     if args.author:
         fm["author"] = args.author
-    fm.setdefault("status", "active")
+    # creation must start at the type's entry status (review M4): a
+    # --file frontmatter must not mint an idea already in testing or a
+    # habit already active - those gates belong to status/approve cmds
+    want_st = fm.get("status")
+    entry_st = DEFAULT_STATUS.get(typ, "active")
+    if typ in ("idea", "habit") and want_st not in (None, "", entry_st):
+        print(f"remember: new {typ} must start as {entry_st!r} "
+              f"(got {want_st!r}); progress it with "
+              "`idea status` / `habit approve`")
+        return 1
+    fm["status"] = want_st or entry_st
     fm.setdefault("version", 1)
     fm.setdefault("author", "mind")
     fm.setdefault("importance", 3)
@@ -775,9 +1007,24 @@ def cmd_remember(args):
 
     typ_dir = root / "MIND" / typ
     stem = _slug(fm["path"]) or f"{typ}-record"
+    # a path must be unique among live records (review m6): two of them
+    # make every path lookup return an arbitrary one
+    ensure_index(root)
+    db0 = open_db(root)
+    try:
+        dup = db0.execute(
+            "SELECT id, status FROM memories WHERE path=? AND status "
+            "NOT IN ('superseded','deleted')",
+            (str(fm["path"]),)).fetchone()
+    finally:
+        db0.close()
+    if dup:
+        print(f"remember: path {fm['path']!r} already used by live record "
+              f"{dup['id']}@... ({dup['status']}); pick another --path")
+        return 1
     target = _collision_free(typ_dir / f"{stem}.md")
     write_md(target, fm, body)
-    rc = _run_sync(root, lenient=False, quiet=True)
+    rc = _run_sync(root, lenient=True, quiet=True)
     rel = target.relative_to(root / "MIND").as_posix()
     db = open_db(root)
     row = db.execute("SELECT id, version FROM memories WHERE file=?",
@@ -799,14 +1046,35 @@ def cmd_update(args):
     if not rec:
         print(f"update: not found: {args.target}")
         return 1
+    # idempotent resume (review M2): a kill after the second write leaves
+    # md in the final state, but get_record now reports the target as
+    # superseded - that is the SUCCESS case, not an error
     if rec["row"]["status"] in DEAD:
+        old_fm_0 = rec["fm"]
+        typ0 = old_fm_0.get("type") or rec["row"]["type"]
+        base0 = re.sub(r"-v\d+$", "", Path(rec["rel"]).stem)
+        ver0 = int(old_fm_0.get("version", rec["row"]["version"]))
+        child0 = root / "MIND" / str(typ0) / f"{base0}-v{ver0 + 1}.md"
+        done = False
+        if child0.is_file():
+            try:
+                cf, _ = parse_frontmatter(
+                    child0.read_text(encoding="utf-8-sig"))
+            except (OSError, UnicodeDecodeError):
+                cf = {}
+            done = str(cf.get("supersedes") or "") == rec["rel"]
+        if done:
+            rc = _run_sync(root, lenient=True, quiet=True)
+            print(f"update: resumed (already done); "
+                  f"{args.target} -> superseded by {child0.name}")
+            return rc
         print(f"update: record is {rec['row']['status']}, not editable")
         return 1
     old_fm = rec["fm"]
     if args.file:
         try:
-            raw = Path(args.file).read_text(encoding="utf-8")
-        except OSError as e:
+            raw = Path(args.file).read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError) as e:
             print(f"update: cannot read {args.file}: {e}")
             return 2
         src_fm, new_body = parse_frontmatter(raw)
@@ -814,7 +1082,9 @@ def cmd_update(args):
         src_fm, new_body = {}, args.text or ""
     new_fm = dict(old_fm)
     for k, v in src_fm.items():
-        if k in ("id", "version", "supersedes", "updated"):
+        # operational identity: never taken from --file (mirrors mem.py
+        # update: no path/type/version hijack, review P0 invariance)
+        if k in ("id", "version", "supersedes", "updated", "path", "type"):
             continue
         new_fm[k] = v
     new_ver = int(old_fm.get("version", 1)) + 1
@@ -822,6 +1092,36 @@ def cmd_update(args):
     new_fm["supersedes"] = rec["rel"]
     new_fm["updated"] = _today()
     new_fm.pop("id", None)
+
+    # status changes through update --file must obey the same gates as
+    # `idea status`: transitions, criterion, WIP (review: file bypass)
+    old_st = old_fm.get("status")
+    new_st = new_fm.get("status")
+    if new_fm.get("type") == "idea" and new_st and new_st != old_st:
+        allowed = IDEA_TRANSITIONS.get(old_st, ())
+        if new_st not in allowed:
+            print(f"update: idea {old_st} -> {new_st} not allowed "
+                  f"(allowed: {', '.join(allowed) or 'none - terminal'}); "
+                  "use `idea status`/`idea kill`")
+            return 1
+        crit = str(new_fm.get("criterion") or "").strip()
+        if new_st in ("testing", "won") and not crit:
+            print("update: idea criterion required before "
+                  f"{new_st}")
+            return 1
+        if new_st == "lost":
+            print("update: use `idea kill ID --by REASON` for lost")
+            return 1
+        if new_st in ("drafted", "testing"):
+            db = open_db(root)
+            try:
+                cur = _idea_wip_count(db)
+            finally:
+                db.close()
+            add = 0 if old_st in ("drafted", "testing") else 1
+            if cur + add > WIP_MAX:
+                print(f"update: idea WIP full ({WIP_MAX} drafted/testing)")
+                return 1
 
     errs, warns = validate_record(new_fm, "update")
     if not _print_validation(errs, warns, "update"):
@@ -831,13 +1131,29 @@ def cmd_update(args):
     typ = new_fm["type"]
     new_file = root / "MIND" / typ / f"{base}-v{new_ver}.md"
     if new_file.exists():
-        print(f"update: target file already exists: {new_file}")
-        return 1
+        # idempotent resume: a kill between the two writes leaves the new
+        # file behind; continue when it carries exactly this update's
+        # supersedes stamp, otherwise it is a foreign collision
+        try:
+            ofm, _ = parse_frontmatter(
+                new_file.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeDecodeError):
+            ofm = {}
+        if str(ofm.get("supersedes") or "") != rec["rel"]:
+            print(f"update: target file already exists: {new_file}")
+            return 1
+    if new_file.exists() and str(old_fm.get("status")) == "superseded":
+        # kill after the second write, before sync: md is already in the
+        # final state, only the index is stale - rebuild and report done
+        rc = _run_sync(root, lenient=True, quiet=True)
+        print(f"update: resumed, index rebuilt (rc={rc}); "
+              f"{rec['row']['id']}@v{rec['row']['version']} -> superseded")
+        return rc
     write_md(new_file, new_fm, new_body)
     old_fm2 = dict(old_fm)
     old_fm2["status"] = "superseded"
     write_md(rec["file"], old_fm2, rec["body"])
-    rc = _run_sync(root, lenient=False, quiet=True)
+    rc = _run_sync(root, lenient=True, quiet=True)
     rel_new = new_file.relative_to(root / "MIND").as_posix()
     db = open_db(root)
     row = db.execute("SELECT id, version FROM memories WHERE file=?",
@@ -879,6 +1195,21 @@ def cmd_restore(args):
     if rec["row"]["status"] != "deleted":
         print(f"restore: not deleted (status={rec['row']['status']})")
         return 1
+    fm = dict(rec["fm"])
+    prev = fm.pop("predelete_status", None)
+    typ = fm.get("type")
+    matrix = STATUS_MATRIX.get(typ, ("active",))
+    if prev not in matrix or prev == "deleted":
+        prev = "active" if "active" in matrix else matrix[0]
+    fm["status"] = prev
+    if prev in DEAD:
+        # not a resurrection (review m1): a record restored back to
+        # superseded cannot collide with its child - no gate needed
+        rc = save_record(root, rec, fm)
+        if rc == 0:
+            print(f"restored {rec['row']['id']}@v{rec['row']['version']} "
+                  f"-> {prev}")
+        return rc
     db = open_db(root)
     child = db.execute(
         "SELECT id, status FROM memories WHERE parent_id=? AND "
@@ -889,13 +1220,6 @@ def cmd_restore(args):
         print(f"restore: refused, active child {child['id']} "
               f"({child['status']}) exists")
         return 1
-    fm = dict(rec["fm"])
-    prev = fm.pop("predelete_status", None)
-    typ = fm.get("type")
-    if prev not in STATUS_MATRIX.get(typ, ()) or prev in DEAD:
-        prev = "active" if "active" in STATUS_MATRIX.get(typ, ()) else \
-            STATUS_MATRIX.get(typ, ("active",))[0]
-    fm["status"] = prev
     rc = save_record(root, rec, fm)
     if rc == 0:
         print(f"restored {rec['row']['id']}@v{rec['row']['version']} "
@@ -1203,8 +1527,8 @@ def cmd_idea_new(args):
     root = find_root()
     if args.file:
         try:
-            raw = Path(args.file).read_text(encoding="utf-8")
-        except OSError as e:
+            raw = Path(args.file).read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError) as e:
             print(f"idea new: cannot read {args.file}: {e}")
             return 2
         fm, body = parse_frontmatter(raw)
@@ -1227,7 +1551,14 @@ def cmd_idea_new(args):
     if args.related_mem:
         fm["related_mem"] = _split_csv(args.related_mem)
     fm.setdefault("scope", "project")
-    fm.setdefault("status", "spark")
+    # creation is always a spark (review M4): --file must not mint an
+    # idea already drafted/testing and skip the WIP gate
+    want_st = fm.get("status")
+    if want_st not in (None, "", "spark"):
+        print(f"idea new: a new idea must start as 'spark' "
+              f"(got {want_st!r}); progress it with `idea status`")
+        return 1
+    fm["status"] = "spark"
     fm.setdefault("version", 1)
     fm.setdefault("author", "mind")
     fm.setdefault("importance", 3)
@@ -1242,7 +1573,7 @@ def cmd_idea_new(args):
     stem = _slug(fm["path"])
     target = _collision_free(root / "MIND" / "idea" / f"{stem}.md")
     write_md(target, fm, body)
-    rc = _run_sync(root, lenient=False, quiet=True)
+    rc = _run_sync(root, lenient=True, quiet=True)
     rel = target.relative_to(root / "MIND").as_posix()
     db = open_db(root)
     row = db.execute("SELECT id, version FROM memories WHERE file=?",
@@ -1305,10 +1636,18 @@ def cmd_idea_kill(args):
         print(f"idea kill: only a testing idea can be killed "
               f"(status={fm.get('status')}); park it or test it first")
         return 1
+    if not str(args.by or "").strip():
+        print("idea kill: --by REASON is required and must be non-empty")
+        return 2
     fm["status"] = "lost"
     fm["killed_by"] = args.by
     fm["killed_at"] = _today()
     fm["updated"] = _today()
+    # a mutated record must validate BEFORE it reaches md (review m7):
+    # lenient sync after the write always returns rc=0
+    errs, warns = validate_record(fm, "idea kill")
+    if not _print_validation(errs, warns, "idea kill"):
+        return 1
     rc = save_record(root, rec, fm)
     if rc == 0:
         print(f"idea {rec['row']['id']}: testing -> lost "
@@ -1500,6 +1839,13 @@ def _mem_contract(root, timeout=20.0, deep=False):
     """-> dict(state=ok|drift|down, report=?, deep_hits=?, broken=?)."""
     out = {"state": "down", "report": None, "deep_hits": [],
            "broken": None, "detail": ""}
+    # one wall-clock budget for the WHOLE probe: without it a hanging mem
+    # can burn timeout x (handshake + deep + up to 20 show) ~ minutes
+    deadline = time.monotonic() + float(timeout)
+
+    def left():
+        return max(1.0, deadline - time.monotonic())
+
     cp = root / "CONTRACT.json"
     if not cp.is_file():
         out["detail"] = "no CONTRACT.json"
@@ -1509,6 +1855,12 @@ def _mem_contract(root, timeout=20.0, deep=False):
     except (OSError, ValueError) as e:
         out["detail"] = f"bad CONTRACT.json: {e}"
         return out
+    for key in ("mem_py", "mem_root"):
+        # a present-but-incomplete contract must not raise Path(None)
+        # out of _mem_contract as a bare traceback (review m8)
+        if not contract.get(key):
+            out["detail"] = f"CONTRACT.json missing {key}"
+            return out
     try:
         mod = load_bridge()
     except Exception as e:
@@ -1517,13 +1869,29 @@ def _mem_contract(root, timeout=20.0, deep=False):
     br = mod.MemBridge(contract.get("mem_py"),
                        contract.get("mem_root"), timeout=timeout)
     try:
+        br.timeout = min(br.timeout, left())
         br.start()
         br.handshake()
+        # mem_root sanity: the child prints "mem serve: root=..." to
+        # stderr; a mismatch means it ignored MEM_ROOT and serves the
+        # wrong memory (review MED)
+        want_root = str(Path(contract.get("mem_root") or "")).rstrip("/\\")
+        # snapshot: the drain thread mutates the deque (review m9)
+        for line in list(br.stderr_tail):
+            if line.startswith("mem serve: root="):
+                got_root = line.split("=", 1)[1].strip().rstrip("/\\")
+                if want_root and got_root.lower() != want_root.lower():
+                    out["detail"] = (f"mem serves root {got_root!r}, "
+                                     f"contract pins {want_root!r}")
+                    return out
+                break
+        br.timeout = min(br.timeout, left())
         report = br.check_contract(contract)
         out["report"] = report
         out["state"] = "ok" if report["ok"] else "drift"
         if deep:
             try:
+                br.timeout = min(br.timeout, left())
                 hits = br.recall("test", limit=3)
                 out["deep_hits"] = [h["citation"] for h in hits]
                 for h in hits:
@@ -1533,6 +1901,10 @@ def _mem_contract(root, timeout=20.0, deep=False):
                         report["ok"] = False
                         out["state"] = "drift"
             except Exception as e:
+                # transport failure (spawn/EOF/timeout) means mem is gone:
+                # DOWN rc=2, not a contract drift (review MAJOR-9)
+                if isinstance(e, getattr(mod, "TransportError", ())):
+                    raise
                 report["drifts"].append(f"recall failed: {e}")
                 report["ok"] = False
                 out["state"] = "drift"
@@ -1555,6 +1927,9 @@ def _mem_contract(root, timeout=20.0, deep=False):
             db.close()
         broken = []
         for c in sorted(cites)[:20]:
+            if time.monotonic() > deadline:
+                break  # budget exhausted: report what we checked
+            br.timeout = min(br.timeout, left())
             if br.show(c) is None:
                 broken.append(c)
         out["broken"] = broken
@@ -1815,7 +2190,15 @@ def main(argv=None):
               "revise": cmd_habit_revise}[args.action]
     else:
         fn = table[args.cmd]
+    # single-writer lock around every mutation (read commands stay lockless)
+    mutating = {cmd_remember, cmd_update, cmd_forget, cmd_restore,
+                cmd_sync, cmd_link, cmd_idea_new, cmd_idea_status,
+                cmd_idea_kill, cmd_habit_approve, cmd_habit_exception,
+                cmd_habit_revise}
     try:
+        if fn in mutating:
+            with MindLock(find_root()):
+                return fn(args) or 0
         return fn(args) or 0
     except KeyboardInterrupt:
         return 130

@@ -55,9 +55,15 @@ def main():
         if method.startswith("notifications/") or mid is None:
             continue  # no response for notifications
         if method == "initialize":
+            ip = msg.get("params") or {}
+            # mirror mem.py:2471 exactly: `ip.get(...) or MCP_PROTOCOL`
+            # (a falsy client version -> the server's OWN version), so the
+            # bridge's protocol drift check compares against the real value
+            ver = (ip.get("protocolVersion")
+                   or os.environ.get("STUB_PROTOCOL")
+                   or "2024-11-05")
             send({"jsonrpc": "2.0", "id": mid, "result": {
-                "protocolVersion": (msg.get("params") or {}).get(
-                    "protocolVersion", "2024-11-05"),
+                "protocolVersion": ver,
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": "mem", "version": version}}})
         elif method == "ping":
@@ -72,7 +78,10 @@ def main():
             if name == "recall":
                 text, is_err = RECALL_TEXT, False
             elif name == "show":
-                if str(arguments.get("target")) == "76@v3":
+                if os.environ.get("STUB_SHOW_BROKEN") == "1":
+                    # sqlite-locked style failure: isError, NOT "not found"
+                    text, is_err = "not in db, run sync", True
+                elif str(arguments.get("target")) == "76@v3":
                     text, is_err = SHOW_OK, False
                 else:
                     text, is_err = (f"not found: "

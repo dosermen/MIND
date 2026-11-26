@@ -51,7 +51,8 @@ F:\AI\MIND\
 | `insight` | `summary, prediction` |
 | `setting` | `mode` (одно из `off, hint, block`) |
 
-`scope`: `agent | project | companion`; для `setting` дополнительно допустим `all`.
+`scope` обязателен для всех типов, кроме `setting`: `agent | project | companion`.
+У `setting` scope опционален и дополнительно допустим `all`.
 `value` у trait: число 0.0–1.0.
 `related_mem`: каждая цитата матчится `^\d+@v\d+$` (иначе warn).
 
@@ -79,9 +80,12 @@ F:\AI\MIND\
   старый файл -> `superseded`, новый получает `supersedes: <старый путь>`;
   sync строит `parent_id` (как mem, второй проход :701–722).
 - Цитата: `id@vN` (vN = version этой записи).
-- `forget` -> `deleted` (tombstone); `restore` отказывает, если есть активный ребёнок.
+- `forget` -> `deleted` (tombstone), `predelete_status` запоминается; `restore` возвращает
+  именно этот статус и отказывает только если воскрешение сделает запись живой при
+  живом ребёнке (restore в `superseded` ребёнка не касается).
 - **Операционные поля не бампят версию** (правка in-place, как `link` в mem):
-  `exceptions, approved_by, approved_at, eligibles, hits, resurrected, expires`.
+  `exceptions, approved_by, approved_at, eligibles, hits, resurrected, expires,
+  predelete_status, killed_by, killed_at, approved/status-переходы lifecycle`.
   Содержательные поля (`direction, hypothesis, summary, action, mode, ...`) — только через `update`.
 - Lifecycle-команды (`idea status`, `habit approve`, ...) правят frontmatter in-place
   (status + тип-поля), версию не бампят: история lifecycle = эти поля + `updated`.
@@ -121,6 +125,10 @@ python mind.py doctor mem [--json] [--deep]
 `--file` может содержать frontmatter целиком: заданные значения побеждают,
 недостающие обязательные берутся из флагов; тип-поля валидируются. Иначе — TEXT-аргумент
 (ровно один источник: TEXT или --file, как в mem; rc=2 при обоих/ни одного).
+Исключения: `update --file` не принимает `id, version, supersedes, updated, path, type`
+(операционная идентичность — из самой записи), а `remember`/`idea new` не могут создать
+idea/habit сразу в не-entry статусе (idea: `spark`, habit: `candidate`) — это обход
+WIP-лимита и гейта approve.
 
 `remember` без `--path`: path = slug из первого слова/типа (дефолт: `type-YYYYMMDD-HHMMSS`).
 
@@ -131,8 +139,11 @@ spark   -> drafted | parked
 drafted -> testing | parked            # testing ТРЕБУЕТ непустой criterion
 testing -> won | lost                  # lost ТРЕБУЕТ killed_by (idea kill)
 parked  -> drafted | testing           # те же гейты
-won/lost -> терминальные (переоткрытие только через update)
+won/lost -> терминальные (переоткрытия нет; `lost` ставится только `idea kill`)
 ```
+
+`update --file` со сменой статуса идеи проходит те же гейты (переходы, criterion, WIP),
+что и `idea status`; `lost` через update запрещён — только `idea kill ID --by REASON`.
 
 WIP-лимит: одновременно `drafted+testing` <= 7. При попытке перевести в drafted/testing
 при WIP>=7 -> rc=1, сообщение «WIP full, сначала parked/win/lost».
@@ -159,7 +170,7 @@ candidate --approve--> active --revise--> deprecated
 - FTS5 по `search_text`; bm25 min-max нормировка; формула (как mem FTS-ветка :154):
   `score = 0.60*bm25 + 0.25*recency + 0.15*importance_norm`,
   `recency = 0.5^(age_days/30)`, `importance_norm = clamp(1..5)/5`.
-- Фильтр: alive (+ `--type`, `--path`-префикс опц.), сортировка score desc.
+- Фильтр: alive (+ `--type`, сортировка score desc).
 - Дефолт: limit 10, бюджет 6000 B на тела (как mem).
 - Вывод: `id@vN [type] path (updated, score)` + тело + `related_mind -> ..` / `related_mem -> ..`
   в конце: `mode: fts (vectors: n/a)`.
@@ -206,13 +217,18 @@ class MemBridge:
                                             # env MEM_ROOT=mem_root (ИНАЧЕ mem примет наш
                                             # .git за свой маркер корня и будет серверить
                                             # не ту память!)
-    def rpc(self, method: str, params: dict) -> dict
-    def handshake(self) -> dict             # initialize -> {serverInfo, protocolVersion}
+    def call(self, name: str, arguments: dict) -> dict
+                                            # tools/call -> {"text", "isError"}
+    def handshake(self) -> dict             # initialize -> {serverInfo, protocolVersion,
+                                            #               capabilities}
     def list_tools(self) -> list[str]
-    def recall(self, query: str, limit: int = 5) -> list[dict]
+    def recall(self, query: str, limit: int = 5, no_vector: bool = True) -> list[dict]
         # -> [{"citation": "76@v3", "score": .., "type": .., "path": ..,
-        #      "updated": .., "content": ..}, ...]  (парсинг текстового ответа MCP)
-    def show(self, citation: str) -> dict | None
+        #      "updated": .., "content": .., "related": ..}, ...]
+        #    (парсинг текстового ответа MCP; футер "-- n/m hits" отрезается)
+    def show(self, citation: str) -> str | None
+        # текст записи; None ТОЛЬКО при явном "not found:" от mem,
+        # прочие isError (locked, "not in db") -> BridgeError
     def check_contract(self, contract: dict) -> dict
         # -> {"ok": bool, "drifts": [str], "server": {...}, "tools": [...]}
     def close(self) -> None                 # terminate дочернего процесса
@@ -235,7 +251,7 @@ class MemBridge:
 
 | Ситуация | Поведение |
 |---|---|
-| mem недоступен | свои записи и recall работают; bridge-часть digest/profile -> warn `mem bridge: down`, rc!=0 только у doctor |
+| mem недоступен | свои записи и recall работают; bridge-часть digest/doctor -> warn `mem bridge: DOWN (<detail>)`, rc!=0 только у doctor |
 | битая цитата | doctor/digest помечают, не чинят молча |
 | mind.db удалён/устарел | sync пересобирает из md (auto-resync, как ensure_fresh) |
 
