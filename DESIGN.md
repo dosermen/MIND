@@ -59,7 +59,7 @@ F:\AI\MIND\
 Опциональные тип-поля (примеры): у trait — `evidence_mem, evidence_mind, counter_evidence`;
 у habit — `eligibles, hits, exceptions, approved_by, approved_at, expires`;
 у idea — `expected, criterion, cost, preconditions, resurrected, killed_by, killed_at`;
-у insight — `falsifiable_by, reflected_on`; у setting — `block_conditions, override, veto_executor`.
+у insight — `falsifiable_by, reflected_on`; у setting — `block_conditions, veto_rules, override, veto_executor`.
 
 ### veto-policy: кто исполняет mode (решение 26.11)
 
@@ -73,8 +73,26 @@ F:\AI\MIND\
 
 Правило честности: `mode: block` без `veto_executor` (code|hook) — **ошибка валидации**
 (агент не может исполнить блок); `veto_executor` при mode != block — тоже ошибка.
-`block_conditions` — список непустых строк (что именно блокируется). `profile`/`digest`
-печатают исполнителя рядом с mode, чтобы «политика» не выглядела сильнее, чем есть.
+`block_conditions` — список непустых строк (что именно блокируется), человекочитаемый.
+`profile`/`digest` печатают исполнителя рядом с mode, чтобы «политика» не выглядела
+сильнее, чем есть.
+
+За человекочитаемым списком стоит машинная таблица **`veto_rules`**: список
+`{id, pattern, reason}`, `pattern` = regex (IGNORECASE), валидируется sync (синтаксис,
+дубликаты id, наличие полей). `mind.py veto ACTION` прогоняет action по правилам
+живых setting-записей (mode != off):
+
+- rc 0 — ни одно правило не сработало (`allow`);
+- rc 1 — сработало: `PROHIBITED` при mode=block (исполнитель указан), иначе
+  `ADVISORY` при mode=hint (помечено как неисполняемое);
+- rc 2 — нет ACTION.
+`--list` печатает все правила; `--json` → `{"action", "verdict": allow|advice|prohibit,
+"hits": [{setting, mode, executor, id, pattern, reason}]}`.
+
+Смысл `veto`: исполнитель — **не модель** (шаг 2 плана 26.11). Раньше `block_conditions`
+висели списком, который не читал ни один путь кода. Шаг 1 — про честные ярлыки;
+шаг 2 — эта команда (детерминированная, тестится); шаг 3 — хук opencode
+(`tool.execute.before`), где mode=block станет реальным запретом.
 
 ## 3. Матрица статусов
 
@@ -131,6 +149,7 @@ python mind.py habit revise ID --keep|--deprecate
 python mind.py profile [--scope S] [--json]
 python mind.py digest [--json]
 python mind.py doctor mem [--json] [--deep]
+python mind.py veto ACTION [--list] [--json]   # хард-veto правила, см. §2
 ```
 
 Режимы вне v0 (НЕ реализуются, не регистрируются): `serve, reflect, resurrect, embed`.

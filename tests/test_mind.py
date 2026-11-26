@@ -1201,6 +1201,103 @@ class TestVetoHonesty(Base):
         self.assertIn("NOT enforced", out)
 
 
+class TestVetoCommand(Base):
+    """`mind.py veto ACTION` - step 2 of the veto plan (approved 26.11)."""
+
+    def make(self, name="vp", mode="hint", rules=None, conditions=None):
+        extra = {"mode": mode, "scope": "all"}
+        if mode == "block":
+            extra["veto_executor"] = "code"
+        if conditions:
+            extra["block_conditions"] = conditions
+        if rules is not None:
+            extra["veto_rules"] = rules
+        self.write_record("setting", name, extra)
+        return self.sync()
+
+    def test_malformed_rules_rejected(self):
+        cases = [
+            ("r1", "not-a-list",
+             "veto_rules must be a list"),
+            ("r2", [{"pattern": "x"}],
+             "needs id and pattern"),
+            ("r3", [{"id": "a", "pattern": "("}],
+             "bad pattern"),
+            ("r4", [{"id": "a", "pattern": "x"},
+                    {"id": "a", "pattern": "y"}],
+             "duplicate veto rule id"),
+            ("r5", ["string-entry"],
+             "must be a mapping"),
+        ]
+        for name, rules, needle in cases:
+            with self.subTest(case=name):
+                import shutil
+                shutil.rmtree(self.root / "MIND")
+                (self.root / "MIND").mkdir()
+                self.write_record("setting", "bad-" + name,
+                                  {"mode": "hint", "veto_rules": rules})
+                rc, out = self.sync()
+                self.assertEqual(rc, 1, out)
+                self.assertIn(needle, out)
+
+    def test_block_mode_prohibits(self):
+        rc, out = self.make("strong", mode="block", rules=[
+            {"id": "kill", "pattern": "rm -rf", "reason": "destructive"}])
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_main("veto", "rm -rf C:/data")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("PROHIBITED", out)
+        self.assertIn("executor: code", out)
+        self.assertIn("destructive", out)
+
+    def test_hint_mode_advises(self):
+        self.make("soft", mode="hint", rules=[
+            {"id": "push", "pattern": "git push", "reason": "ask first"}])
+        rc, out = self.run_main("veto", "git push origin main")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("ADVISORY", out)
+        self.assertIn("not enforced", out)
+
+    def test_off_setting_is_silent(self):
+        self.make("offmode", mode="off", rules=[
+            {"id": "x", "pattern": "git push", "reason": "r"}])
+        rc, out = self.run_main("veto", "git push")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("allow", out)
+
+    def test_allow_and_bad_usage(self):
+        self.make("clean", mode="hint",
+                  rules=[{"id": "x", "pattern": "git push"}])
+        rc, out = self.run_main("veto", "python mind.py list")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("allow", out)
+        rc, out = self.run_main("veto")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("ACTION required", out)
+
+    def test_json_verdict(self):
+        self.make("j", mode="block", rules=[
+            {"id": "a", "pattern": "shutdown /s"}])
+        rc, out = self.run_main("veto", "shutdown /s /t 60", "--json")
+        self.assertEqual(rc, 1, out)
+        data = json.loads(out)
+        self.assertEqual(data["verdict"], "prohibit")
+        self.assertEqual(data["hits"][0]["id"], "a")
+        self.assertEqual(data["hits"][0]["executor"], "code")
+        rc, out = self.run_main("veto", "ls -la", "--json")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(json.loads(out)["verdict"], "allow")
+
+    def test_list_shows_rules(self):
+        self.make("listed", mode="hint", rules=[
+            {"id": "p1", "pattern": "git push", "reason": "explicit yes"}])
+        rc, out = self.run_main("veto", "--list")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("listed: mode=hint", out)
+        self.assertIn("p1: git push", out)
+        self.assertIn("explicit yes", out)
+
+
 REAL_MEM = Path(r"F:\AI\OLAMA\tools\mem.py")
 
 
