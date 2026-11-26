@@ -3,3 +3,4 @@ mind.db-*
 __pycache__/
 *.pyc
 logs/
+MIND.md
