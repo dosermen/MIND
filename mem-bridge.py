@@ -93,6 +93,7 @@ class MemBridge:
         self.server_info = None
         self.protocol_version = None
         self._handshaken = False
+        self._request_lock = threading.RLock()
         # last stderr lines of the child: attached to errors so a bad
         # MEM_ROOT/typo shows the real reason instead of a bare EOF
         self.stderr_tail = deque(maxlen=20)
@@ -151,66 +152,68 @@ class MemBridge:
         return f" (stderr: {tail})" if tail else ""
 
     def _request(self, method, params=None):
-        if self.proc is None:
-            raise BridgeError("bridge not started")
-        self._id += 1
-        mid = self._id
-        msg = {"jsonrpc": "2.0", "id": mid, "method": method,
-               "params": params or {}}
-        try:
-            self.proc.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
-            self.proc.stdin.flush()
-        except (OSError, ValueError) as e:
-            raise TransportError(f"mem pipe write failed: {e}"
-                                 f"{self._stderr_hint()}")
-        # one deadline per request: a chatty stream must not reset the timer
-        deadline = time.monotonic() + self.timeout
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TransportError(
-                    f"mem timeout waiting for {method} "
-                    f"({self.timeout:.0f}s){self._stderr_hint()}")
+        with self._request_lock:
+            if self.proc is None:
+                raise BridgeError("bridge not started")
+            self._id += 1
+            mid = self._id
+            msg = {"jsonrpc": "2.0", "id": mid, "method": method,
+                   "params": params or {}}
             try:
-                line = self._q.get(timeout=remaining)
-            except queue.Empty:
-                raise TransportError(
-                    f"mem timeout waiting for {method} "
-                    f"({self.timeout:.0f}s){self._stderr_hint()}")
-            if line is None:
-                raise TransportError("mem serve exited (EOF)"
+                self.proc.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                self.proc.stdin.flush()
+            except (OSError, ValueError) as e:
+                raise TransportError(f"mem pipe write failed: {e}"
                                      f"{self._stderr_hint()}")
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue  # not JSON-RPC traffic, ignore
-            if not isinstance(data, dict) or data.get("id") != mid:
-                continue  # notification or foreign response
-            err = data.get("error")
-            if err:
-                err = err if isinstance(err, dict) else {}
-                raise BridgeError(f"mem rpc error {err.get('code')}: "
-                                  f"{err.get('message')}")
-            res = data.get("result", {})
-            if not isinstance(res, dict):
-                raise BridgeError(f"mem bad result for {method}: "
-                                  f"{type(res).__name__}")
-            return res
+            # one deadline per request: a chatty stream must not reset the timer
+            deadline = time.monotonic() + self.timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TransportError(
+                        f"mem timeout waiting for {method} "
+                        f"({self.timeout:.0f}s){self._stderr_hint()}")
+                try:
+                    line = self._q.get(timeout=remaining)
+                except queue.Empty:
+                    raise TransportError(
+                        f"mem timeout waiting for {method} "
+                        f"({self.timeout:.0f}s){self._stderr_hint()}")
+                if line is None:
+                    raise TransportError("mem serve exited (EOF)"
+                                         f"{self._stderr_hint()}")
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # not JSON-RPC traffic, ignore
+                if not isinstance(data, dict) or data.get("id") != mid:
+                    continue  # notification or foreign response
+                err = data.get("error")
+                if err:
+                    err = err if isinstance(err, dict) else {}
+                    raise BridgeError(f"mem rpc error {err.get('code')}: "
+                                      f"{err.get('message')}")
+                res = data.get("result", {})
+                if not isinstance(res, dict):
+                    raise BridgeError(f"mem bad result for {method}: "
+                                      f"{type(res).__name__}")
+                return res
 
     def _notify(self, method, params=None):
-        if self.proc is None:
-            return
-        try:
-            msg = {"jsonrpc": "2.0", "method": method}
-            if params is not None:
-                msg["params"] = params
-            self.proc.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
-            self.proc.stdin.flush()
-        except (OSError, ValueError):
-            pass  # fire-and-forget
+        with self._request_lock:
+            if self.proc is None:
+                return
+            try:
+                msg = {"jsonrpc": "2.0", "method": method}
+                if params is not None:
+                    msg["params"] = params
+                self.proc.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                self.proc.stdin.flush()
+            except (OSError, ValueError):
+                pass  # fire-and-forget
 
     # -- protocol -------------------------------------------------------
     def handshake(self):

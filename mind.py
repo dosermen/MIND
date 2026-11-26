@@ -24,6 +24,7 @@ import struct
 import sys
 import time
 import traceback
+import threading
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta
@@ -381,6 +382,18 @@ class MindLock:
     def __init__(self, root):
         self.path = Path(root) / "mind.lock"
         self.acquired = False
+        self._owner = None
+        self._heartbeat_stop = None
+        self._heartbeat_thread = None
+
+    def _heartbeat(self, interval=30.0):
+        while not self._heartbeat_stop.wait(interval):
+            try:
+                if self.path.read_text(encoding="ascii") != self._owner:
+                    return
+                os.utime(str(self.path), None)
+            except (OSError, UnicodeDecodeError):
+                return
 
     def __enter__(self):
         global _LOCK_HELD
@@ -390,10 +403,21 @@ class MindLock:
             try:
                 fd = os.open(str(self.path),
                              os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.write(fd, str(os.getpid()).encode("ascii"))
+                owner = hashlib.sha256(
+                    f"{os.getpid()}-{time.time_ns()}".encode("ascii")
+                ).hexdigest()
+                os.write(fd, owner.encode("ascii"))
                 os.close(fd)
+                self._owner = owner
                 self.acquired = True
                 _LOCK_HELD = True
+                self._heartbeat_stop = threading.Event()
+                self._heartbeat_thread = threading.Thread(
+                    target=self._heartbeat,
+                    name="mind-lock-heartbeat",
+                    daemon=True,
+                )
+                self._heartbeat_thread.start()
                 return self
             except FileExistsError:
                 try:
@@ -418,8 +442,13 @@ class MindLock:
     def __exit__(self, *exc):
         global _LOCK_HELD
         if self.acquired:
+            if self._heartbeat_stop is not None:
+                self._heartbeat_stop.set()
+                if self._heartbeat_thread is not None:
+                    self._heartbeat_thread.join(timeout=1.0)
             try:
-                self.path.unlink()
+                if self.path.read_text(encoding="ascii") == self._owner:
+                    self.path.unlink()
             except OSError:
                 pass
             self.acquired = False
@@ -675,6 +704,22 @@ def _lossy_fm(text):
         v = raw.partition(":")[2].strip()
         if re.fullmatch(r"[|>][-+]?\d*", v):
             bad.append(f"line {i} block scalar {v!r}")
+        q = None
+        escaped = False
+        for j, ch in enumerate(v):
+            if escaped:
+                escaped = False
+                continue
+            if ch == "\\" and q == '"':
+                escaped = True
+                continue
+            if ch in ("\"", "'"):
+                q = None if q == ch else ch
+                continue
+            if ch == "#" and q is None and (
+                    j == 0 or v[j - 1].isspace()):
+                bad.append(f"line {i} inline comment")
+                break
     return bad
 
 

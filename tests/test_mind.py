@@ -37,6 +37,11 @@ def parse(text):
 class TestFrontmatter(unittest.TestCase):
     """dump -> parse roundtrip for every shape we use."""
 
+    def test_inline_comment_is_lossy_and_rejected(self):
+        text = '---\nx: "a" # comment\n---\nbody\n'
+        lossy = mind._lossy_fm(text)
+        self.assertIn("inline comment", "; ".join(lossy))
+
     def test_split_top_respects_escapes(self):
         # review CRITICAL (26.11): \" inside a quoted value must not open
         # a split point - `5" bolt, tight` used to be cut at the comma
@@ -1682,6 +1687,15 @@ class TestP0ReviewFixes(Base):
             with mind.MindLock(self.root):   # nested must not deadlock
                 pass
         self.assertFalse((self.root / "mind.lock").exists())
+
+    def test_mindlock_exit_does_not_remove_replacement(self):
+        lock = mind.MindLock(self.root)
+        lock.__enter__()
+        lock.path.write_text("replacement-owner", encoding="ascii")
+        lock.__exit__(None, None, None)
+        self.assertTrue(lock.path.exists(),
+                        "exit removed a lock owned by another process")
+        lock.path.unlink()
 
 
 class TestVetoHonesty(Base):
