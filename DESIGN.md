@@ -31,7 +31,7 @@ F:\AI\MIND\
 │   ├── trait\  habit\  idea\  insight\  setting\
 ├── mind.db              # SQLite (генерируется)
 ├── logs\                # doctor/digest логи
-├── docs\calibration.md  # локальный лист черт, gitignored
+├── docs\calibration.md  # локальный лист черт, gitignored (шаблон: calibration.example.md)
 └── tests\               # unittest, MIND_ROOT -> tempdir
 ```
 
@@ -442,3 +442,20 @@ slice 3: eligible-журнал + детектор привычек.
 slice 4: resurrect (ночной, cosine >= 0.75 — порог doc_links mem).
 slice 5: reflect (калибровка прогнозов, <=1 insight).
 slice 6: recall-буст identity (×1.3) — только после замера эффекта slice 1.
+
+## 14. Гипотезы аудита 26.11 — вердикты (AUDIT.md §9)
+
+- **H1 (stale-lock vs длинный rebuild) — риск не подтвердился.** Probe:
+  heartbeat живого владельца держит mtime свежим, второй процесс видит
+  held и получает BUSY; steal срабатывает только на мёртвом владельце.
+- **H2 (os.replace-steal при открытом fd, Windows) — steal падает
+  безопасно.** Пока второй процесс держит lockfile открытым, `os.replace`
+  даёт PermissionError (WinError 32) → `except OSError` → без порчи
+  lockfile и без захвата. Probe: `tests/h2-lock-open-handle-probe.py`.
+- **H3 (protocolVersion mismatch) — закрыт тестом.** Reject до вызова
+  инструментов, doctor → `contract: DRIFT`, rc=1
+  (`test_protocol_mismatch_is_reported_as_drift`: `0.1`, `1999-01-01`).
+- **H4 (embed/hybrid покрытие) — подтверждено.** Vector-only ветка
+  косинуса (FTS не видит запись — гибрид находит), fallback'и
+  no-vectors / remote-down / partial и порядок кандидатов
+  (`test_hybrid_ranks_by_cosine_among_vector_only`) — в тестах.

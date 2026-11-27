@@ -405,6 +405,8 @@ MCP_MAX_LINE = 1 * 1024 * 1024
 # (review M1: reads rebuilt the store with no lock at all)
 _LOCK_HELD = False
 # True only while this process owns the outermost MindLock acquisition.
+# Process-wide (not thread-local): serve dispatches sequentially and one
+# root is active at a time, so nested acquisitions always share a root.
 
 
 class MindLock:

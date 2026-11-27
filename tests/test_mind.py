@@ -988,6 +988,36 @@ class TestEmbedHybrid(Base):
         self.assertIn("rigor", out)
         self.assertIn("mode: hybrid", out)
 
+    def test_hybrid_ranks_by_cosine_among_vector_only(self):
+        # Both candidates are invisible to FTS (bn=0) with equal recency
+        # and importance -> cosine alone must decide the order (H4).
+        for name, body in (("near", "disk defrag schedule weekly\n"),
+                           ("far", "disk defrag schedule daily\n")):
+            self.write_record("trait", name,
+                              {"status": "active", "scope": "agent",
+                               "value": 0.5, "direction": "d",
+                               "falsified_when": "f"},
+                              body)
+        self.sync()
+        self.run_main("embed")           # both get vectors
+        near_id = self.id_of("trait", "near")
+        db = mind.open_db(self.root)
+        try:
+            vec = mind.unpack_vec(db.execute(
+                "SELECT vec FROM mind_vec WHERE mem_id=?", (near_id,)
+            ).fetchone()["vec"])
+        finally:
+            db.close()
+        # query shares no words with either body, but the stub pins it
+        # to near's own vector: cos(q, near)=1.0 > cos(q, far)~0.75
+        _EmbedStubHandler.overrides["hidden needle"] = list(vec)
+        os.environ["MIND_RECALL"] = "hybrid"
+        rc, out = self.run_main("recall", "hidden needle", "--json")
+        self.assertEqual(rc, 0, out)
+        hits = json.loads(out)
+        self.assertEqual([h["path"] for h in hits], ["near", "far"], out)
+        self.assertGreater(hits[0]["score"], hits[1]["score"])
+
     def test_hybrid_partial_footer(self):
         self.make_trait(name="alpha", body="needle alpha\n")
         self.run_main("embed")                   # alpha gets a vector
