@@ -12,12 +12,12 @@
   </defs>
 
   <rect width="1200" height="870" fill="#f8fafc"/>
-  <text x="20" y="32" font-size="20" font-weight="bold" fill="#0f172a">MIND — как всё работает (slice 0 + note + embed, 26.11.2026)</text>
-  <text x="20" y="52" font-size="12.5" fill="#64748b">md = источник истины, mind.db = производный индекс; агент не может сам себе санкционировать (красная рамка = гейт); гибрид recall — opt-in до A/B-гейта</text>
+  <text x="20" y="32" font-size="20" font-weight="bold" fill="#0f172a">MIND — как всё работает (mindlib, 27.11.2026)</text>
+  <text x="20" y="52" font-size="12.5" fill="#64748b">md = источник истины, mind.db = производный индекс; гейты в коде (красная рамка = гейт); frontmatter — lossy-подмножество YAML; гибрид recall — opt-in до A/B-гейта</text>
 
   <!-- ===== column headers ===== -->
   <text x="20" y="84" font-size="13.5" font-weight="bold" fill="#7c3aed" letter-spacing="1">ИСТОЧНИКИ</text>
-  <text x="310" y="84" font-size="13.5" font-weight="bold" fill="#0f172a" letter-spacing="1">MIND (mind.py) — гейты и запись</text>
+  <text x="310" y="84" font-size="13.5" font-weight="bold" fill="#0f172a" letter-spacing="1">MIND (mindlib; mind.py = shim) — гейты и запись</text>
   <text x="800" y="84" font-size="13.5" font-weight="bold" fill="#2563eb" letter-spacing="1">ПОТРЕБИТЕЛИ</text>
 
   <!-- ===== A: sources ===== -->
@@ -84,10 +84,15 @@
   <text x="814" y="405" font-size="12" fill="#475569">hint → ask; fail-open; logs/veto-hook.log</text>
   <text x="814" y="423" font-size="11.5" fill="#64748b">политика seed: hint + executor none (пока)</text>
 
+  <rect x="800" y="453" width="380" height="78" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="814" y="479" font-size="13.5" font-weight="bold" fill="#0f172a">doctor mem [--deep] — контракт с mem</text>
+  <text x="814" y="501" font-size="12" fill="#475569">OK / DRIFT (protocolVersion, serverInfo) / DOWN</text>
+  <text x="814" y="521" font-size="12" fill="#475569">deep: recall + цитаты + frontmatter-поля; rc 0/1/2</text>
+
   <!-- ===== E: external ===== -->
   <rect x="20" y="700" width="560" height="64" rx="8" fill="#f8fafc" stroke="#64748b" stroke-width="1.5" stroke-dasharray="6 4"/>
   <text x="34" y="726" font-size="13.5" font-weight="bold" fill="#0f172a">mem — только чтение</text>
-  <text x="34" y="748" font-size="12" fill="#475569">mem-bridge → CONTRACT.json (9 tools); related_mem — цитаты</text>
+  <text x="34" y="748" font-size="12" fill="#475569">mem-bridge → CONTRACT.json + env/local пути; protocol handshake; related_mem — цитаты</text>
 
   <rect x="610" y="700" width="570" height="64" rx="8" fill="#f8fafc" stroke="#64748b" stroke-width="1.5" stroke-dasharray="6 4"/>
   <text x="624" y="726" font-size="13.5" font-weight="bold" fill="#0f172a">Embedding: телефон (5031)</text>
@@ -123,6 +128,7 @@
     <path d="M772 203 H796" marker-end="url(#ar)"/>
     <path d="M772 286 H796" marker-end="url(#ar)"/>
     <path d="M772 383 H796" marker-end="url(#ar)"/>
+    <path d="M772 492 H796" marker-end="url(#ar)"/>
   </g>
 
   <!-- C2 -> E (dashed) -->
@@ -141,6 +147,7 @@
     <text x="490" y="814">▬ оранжевое = note/recalc-петля</text>
     <text x="760" y="814">▬ зелёное = хранилище (md — истина)</text>
     <text x="1030" y="814">▬ пунктир = внешняя связь</text>
-    <text x="20" y="838">Петля пересчёта: note (2×side) → digest recalc_pending → update ±0.1 → новая версия md → sync → profile видит новый value. Embed по sig: изменённый текст переэмбедивается, мёртвый телефон = FTS. Решения (approve, калибровка) — всегда за пользователем.</text>
+    <text x="20" y="838">Петля пересчёта: note (2×side) → digest recalc_pending → update ±0.1 → новая версия md → sync → profile видит новый value.</text>
+    <text x="20" y="858">Embed по sig: изменённый текст переэмбедируется, мёртвый телефон = FTS. Решения (approve, калибровка) — всегда за пользователем.</text>
   </g>
 </svg>

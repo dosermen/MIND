@@ -95,11 +95,14 @@ the fact, not the opinion. Validation refuses `mode: block` without a
 ## Layout
 
 ```
-mind.py          single-file CLI + MCP server (stdlib only)
+mind.py          compatibility shim -> mindlib (same CLI, same imports)
+mindlib/         package: core (store/lock/parser), cli, mcp, veto,
+                 bridge_glue (contract + doctor); stdlib-only
 mem-bridge.py    read-only JSON-RPC client to the outer mem server
-CONTRACT.json    pinned contract for that bridge
+CONTRACT.json    pinned contract (no host-specific paths)
+CONTRACT.local.json  local mem paths, gitignored (or MIND_MEM_* env)
 MIND/            records - the source of truth (tracked in git)
-docs/            DESIGN.md - architecture, gates, roadmap
+docs/            DESIGN.md + mind-flow.svg - architecture, gates, roadmap
 tests/           unittest suite, includes a stub mem server
 ```
 
