@@ -1,7 +1,10 @@
 # DESIGN.md — MIND v0 (slice 0)
 
 Контракт схемы, CLI и моста к mem. Источник истины для кода — этот файл.
-Код: `mind.py` + `mem-bridge.py`. Python 3.10+, только stdlib, 0 внешних зависимостей.
+Код: пакет `mindlib/`, shim `mind.py` и `mem-bridge.py`. Имя пакета
+`mindlib` необходимо на Windows: файловая система не различает каталоги
+`mind/` и `MIND/`, где хранятся записи. Python 3.10+, только stdlib во время
+выполнения, 0 внешних зависимостей.
 
 ## 0. Принципы
 
@@ -18,7 +21,8 @@
 
 ```
 F:\AI\MIND\
-├── mind.py              # CLI + ядро
+├── mind.py              # совместимый CLI shim
+├── mindlib\             # ядро, MCP, veto, bridge и CLI
 ├── mem-bridge.py        # MemBridge: MCP-клиент к mem (единственная точка касания)
 ├── DESIGN.md            # этот файл
 ├── CONTRACT.json        # пиннинг ожидаемого контракта mem
@@ -27,13 +31,21 @@ F:\AI\MIND\
 │   ├── trait\  habit\  idea\  insight\  setting\
 ├── mind.db              # SQLite (генерируется)
 ├── logs\                # doctor/digest логи
-├── docs\calibration.md  # калибровочный лист черт
+├── docs\calibration.md  # локальный лист черт, gitignored
 └── tests\               # unittest, MIND_ROOT -> tempdir
 ```
 
 Корень переопределяется env `MIND_ROOT` (аналог `MEM_ROOT`) — обязательно для тестов.
 
 ## 2. Frontmatter-контракт
+
+Парсер понимает только ограниченное подмножество YAML: строки `key: scalar`,
+скаляры в одинарных/двойных кавычках, блочные списки с `- item` и вложенные
+записи списка в форме `- {key: value}`. Одиночное bracket-значение вроде `[76@v3]`
+и пустой список `[]` сохраняются для совместимости; flow-структуры (`[a, b]`, `{a: b}`),
+anchors/aliases, merge-ключи, теги, block scalars, комментарии в конце строки
+и многострочные продолжения не переписываются автоматически. При такой
+конструкции `sync` сообщает `NOT rewritten, fix by hand`.
 
 Обязательные (пишет sync, если отсутствуют/битые): `id, type, path, status, version, author, updated`.
 Опциональные: `importance` (1–5, дефолт 3), `confidence` (0.0–1.0, дефолт 0.5),
@@ -321,8 +333,6 @@ hard-veto условий.
 {
   "contract_version": 1,
   "pinned_at": "2026-11-25",
-  "mem_py": "F:\\AI\\OLAMA\\tools\\mem.py",
-  "mem_root": "F:\\AI\\OLAMA",
   "protocol": "2024-11-05",
   "serverInfo": {"name": "mem", "version": "2.0.0"},
   "tools": ["remember","recall","search","update_memory","forget","restore","list","show","link"],
@@ -330,6 +340,12 @@ hard-veto условий.
   "citation_pattern": "^\\d+@v\\d+$"
 }
 ```
+
+Пути к локальной установке mem не являются частью контракта: задайте
+`MIND_MEM_PY` и `MIND_MEM_ROOT` либо создайте игнорируемый git-файл
+`CONTRACT.local.json` с полями `mem_py` и `mem_root`. Переменные окружения
+имеют приоритет; если пути не настроены, `doctor mem` сообщает `DOWN` и
+подсказку по настройке.
 
 API `mem_bridge.MemBridge` (единственная точка касания mem):
 
@@ -361,6 +377,18 @@ class MemBridge:
 Протокол: stdio, newline-delimited JSON-RPC 2.0, `initialize` c
 `clientInfo: {"name":"mind","version":"0.1"}`, `tools/list`, `tools/call {name, arguments}`.
 Точные имена параметров recall — смотреть в `_mcp_tools` mem.py (~:2254), НЕ гадать.
+
+При `initialize` bridge намеренно отправляет пустой `protocolVersion`, чтобы
+сервер вернул свою фактическую версию, а не отзеркалил клиентскую. Несовпадение
+с поддерживаемой версией отклоняется как protocol drift до вызова инструментов;
+оно не принимается молча и `doctor mem` возвращает drift (rc 1).
+
+Threat model: markdown-записи и входящие строки stdio считаются недоверенными
+данными, способными содержать некорректный/опасный синтаксис; их парсинг и
+проверки ограничивают границу доверия на стороне приложения/bridge. Bridge
+разрешает только чтение удалённых записей и не исполняет содержимое markdown.
+Локальный пользователь и его конфигурация (включая `CONTRACT.local.json`)
+считаются доверенными; это не защита от злонамеренного владельца машины.
 
 `python mind.py doctor mem`:
 1. bridge.start + handshake + tools/list;

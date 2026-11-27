@@ -16,9 +16,10 @@ MCP. Activation gates live in code - the agent cannot sanction itself.
   `habit approve`). An idea cannot skip its state machine. A trait value
   change consumes the observations that triggered it.
 - **One-way bridge to mem.** The outer memory server is reached
-  read-only through a pinned contract (`CONTRACT.json`); `doctor mem`
-  reports drift instead of hiding it.
-- **Local-first, stdlib-only.** Single-file `mind.py`, no runtime
+  read-only through a pinned contract (`CONTRACT.json`); host-specific paths
+  come from `MIND_MEM_PY`/`MIND_MEM_ROOT` or ignored `CONTRACT.local.json`.
+  `doctor mem` reports drift instead of hiding it.
+- **Local-first, stdlib-only.** Modular `mindlib` package, no runtime
   dependencies. Optional embeddings go to a remote endpoint you
   configure; when it is down, search falls back to FTS and never stalls.
 

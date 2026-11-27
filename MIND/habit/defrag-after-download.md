@@ -10,7 +10,8 @@ confidence: 0.3
 scope: agent
 trigger: after every model/module/build download
 action: "path to logs\\wc-queue.txt + schtasks /Run /TN WinContig-Defrag (HDD only, never C:/D:)"
-related_mem: [76@v3]
+related_mem:
+  - 76@v3
 id: 1
 approved_by: user
 approved_at: 2026-11-25

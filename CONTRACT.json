@@ -1,8 +1,6 @@
 {
   "contract_version": 1,
   "pinned_at": "2026-11-25",
-  "mem_py": "F:\\AI\\OLAMA\\tools\\mem.py",
-  "mem_root": "F:\\AI\\OLAMA",
   "protocol": "2024-11-05",
   "serverInfo": {"name": "mem", "version": "2.0.0"},
   "tools": ["remember", "recall", "search", "update_memory", "forget", "restore", "list", "show", "link"],

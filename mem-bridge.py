@@ -33,6 +33,10 @@ class TransportError(BridgeError):
     """Spawn/EOF/timeout/pipe failure: mem itself is unreachable (DOWN)."""
 
 
+class ProtocolVersionError(BridgeError):
+    """The peer's negotiated MCP version differs from the supported pin."""
+
+
 # text header printed by mem cmd_recall:
 # [0.8312] 76@v3 semantic inkling2-mini-recon-v3 (2026-11-25, imp 5) -> file
 # path is lazy up to " (" (defensive), file may carry " [budget exhausted]"
@@ -217,12 +221,8 @@ class MemBridge:
 
     # -- protocol -------------------------------------------------------
     def handshake(self):
-        # Send a FALSY protocolVersion on purpose: mem echoes the client's
-        # value when present (mem.py:2471 `ip.get(...) or MCP_PROTOCOL`),
-        # so sending our own constant would compare it against itself and
-        # hide a server-side bump. An unsupported version makes mem reply
-        # with ITS real MCP_PROTOCOL, which check_contract then compares
-        # against the CONTRACT.json pin (audit 25.11, review MAJOR-1).
+        # Send a FALSY protocolVersion so the server returns its actual
+        # version rather than echoing ours; reject drift before using tools.
         res = self._request("initialize", {
             "protocolVersion": "",
             "capabilities": {},
@@ -230,6 +230,10 @@ class MemBridge:
         })
         self.server_info = res.get("serverInfo") or {}
         self.protocol_version = res.get("protocolVersion")
+        if self.protocol_version != MCP_PROTOCOL:
+            raise ProtocolVersionError(
+                f"protocol mismatch: supported {MCP_PROTOCOL!r}, "
+                f"server offered {self.protocol_version!r}")
         self._notify("notifications/initialized")
         self._handshaken = True
         return {"serverInfo": self.server_info,

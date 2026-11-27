@@ -12,8 +12,10 @@ hypothesis: Inkling-2-Mini loop architecture (48 KV slots) fits 12 GB at ctx >= 
 expected: tg >= 20 t/s at ctx 32k
 criterion: "2 runs, tg >= 20 t/s at ctx 32k"
 cost: "8.5 GB download + 639 MB mmproj, ~30 min"
-preconditions: [GGUF contains nextn/MTP tensors]
-related_mem: [76@v3]
+preconditions:
+  - GGUF contains nextn/MTP tensors
+related_mem:
+  - 76@v3
 resurrected: null
 killed_by: "ctx sweep 25.11: 28k=8.3 t/s, 32k=7.6, 64k=1.5 - KV pinned alloc fail, working ctx only 16k"
 killed_at: 2026-11-25

@@ -20,6 +20,7 @@ import unittest
 import zlib
 from datetime import date, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 SRC = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SRC))
@@ -41,6 +42,36 @@ class TestFrontmatter(unittest.TestCase):
         text = '---\nx: "a" # comment\n---\nbody\n'
         lossy = mind._lossy_fm(text)
         self.assertIn("inline comment", "; ".join(lossy))
+
+    def test_unsupported_yaml_subset_constructs_are_lossy(self):
+        cases = (
+            "key: &a value",
+            "key: &a",
+            "key: *a",
+            "<<: *base",
+            "key: {a: b}",
+            "key: [1, 2]",
+            "key: !!str x",
+            "key: !!int 3",
+        )
+        for line in cases:
+            with self.subTest(line=line):
+                self.assertTrue(
+                    mind._lossy_fm(f"---\n{line}\n---\n"),
+                    f"{line!r} must be rejected before rewrite")
+
+    def test_supported_yaml_subset_values_are_not_lossy(self):
+        text = (
+            "---\n"
+            "path: memory/semantic/x.md\n"
+            'summary: "5\\" bolt, tight"\n'
+            "reason: push #2 to main\n"
+            "related_mem: [76@v3]\n"
+            "items:\n"
+            "  - item\n"
+            "---\n"
+        )
+        self.assertEqual(mind._lossy_fm(text), [])
 
     def test_split_top_respects_escapes(self):
         # review CRITICAL (26.11): \" inside a quoted value must not open
@@ -68,6 +99,14 @@ class TestFrontmatter(unittest.TestCase):
         self.assertEqual(got, self.SAMPLE)
         self.assertEqual(body, "body line\n")
 
+    def test_dump_uses_block_lists_in_supported_subset(self):
+        text = mind.dump_frontmatter({"items": ["one", "two"]})
+        self.assertIn("items:\n  - one\n  - two\n", text)
+        self.assertEqual(mind._lossy_fm(text), [])
+
+    def test_nested_flow_sequence_is_lossy(self):
+        self.assertTrue(mind._lossy_fm("---\nitems:\n  - [one]\n---\n"))
+
     def test_no_frontmatter(self):
         fm, body = parse("plain text\n")
         self.assertEqual(fm, {})
@@ -79,10 +118,28 @@ class TestFrontmatter(unittest.TestCase):
         self.assertEqual(mind._as_list(fm["related_mem"]), ["76@v3"])
 
 
+class TestAtomicWrite(unittest.TestCase):
+    def test_replace_survives_directory_fsync_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "record.md"
+            path.write_text("old\n", encoding="utf-8")
+            with patch("mind.os.open", return_value=123), \
+                    patch("mind.os.close"), \
+                    patch("mind.os.fsync",
+                          side_effect=[None, OSError("simulated crash")]):
+                mind.atomic_write(path, "new\n")
+            self.assertEqual(path.read_text(encoding="utf-8"), "new\n")
+            self.assertEqual(list(Path(tmp).glob("record.md.tmp*")), [])
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name).resolve()
+        self._mem_path_env = {
+            key: os.environ.pop(key, None)
+            for key in ("MIND_MEM_PY", "MIND_MEM_ROOT")
+        }
         os.environ["MIND_ROOT"] = str(self.root)
         (self.root / "MIND").mkdir()
 
@@ -90,6 +147,12 @@ class Base(unittest.TestCase):
         os.environ.pop("MIND_ROOT", None)
         os.environ.pop("STUB_EXTRA_TOOL", None)
         os.environ.pop("STUB_VERSION", None)
+        os.environ.pop("STUB_PROTOCOL", None)
+        for key, value in self._mem_path_env.items():
+            if value is None:
+                os.environ.pop(key, None)   # test set it: must not leak
+            else:
+                os.environ[key] = value
         self.tmp.cleanup()
 
     # -- helpers -------------------------------------------------------
@@ -134,8 +197,6 @@ class Base(unittest.TestCase):
         contract = {
             "contract_version": 1,
             "pinned_at": "2026-11-25",
-            "mem_py": str(mem_py or STUB),
-            "mem_root": str(self.root),
             "protocol": "2024-11-05",
             "serverInfo": {"name": "mem", "version": "2.0.0"},
             "tools": list(PINNED_TOOLS),
@@ -145,6 +206,10 @@ class Base(unittest.TestCase):
         }
         (self.root / "CONTRACT.json").write_text(
             json.dumps(contract, indent=2), encoding="utf-8")
+        (self.root / "CONTRACT.local.json").write_text(
+            json.dumps({"mem_py": str(mem_py or STUB),
+                        "mem_root": str(self.root)}, indent=2),
+            encoding="utf-8")
         return contract
 
     def make_insight(self, name, summary="green smoke is not fast"):
@@ -1007,6 +1072,43 @@ class TestDoctor(Base):
         self.assertEqual(rc, 0)
         self.assertIn("deep recall: 1 hits (76@v3)", out)
 
+    def test_mem_paths_environment_overrides_local(self):
+        self.write_contract(mem_py="local-mem.py")
+        py, root, err = mind._resolve_mem_paths(self.root)
+        self.assertIsNone(err)
+        self.assertEqual(py, "local-mem.py")
+        self.assertEqual(root, str(self.root))
+        os.environ["MIND_MEM_PY"] = str(STUB)
+        os.environ["MIND_MEM_ROOT"] = str(self.root)
+        self.assertEqual(
+            mind._resolve_mem_paths(self.root),
+            (str(STUB), str(self.root), None))
+
+    def test_mem_paths_missing_reports_configuration_hint(self):
+        self.write_contract()
+        (self.root / "CONTRACT.local.json").unlink()
+        res = mind._mem_contract(self.root, timeout=5.0)
+        self.assertEqual(res["state"], "down")
+        self.assertIn("MIND_MEM_PY", res["detail"])
+        self.assertIn("CONTRACT.local.json", res["detail"])
+
+    def test_malformed_local_contract_is_down_with_error(self):
+        self.write_contract()
+        (self.root / "CONTRACT.local.json").write_text("{", encoding="utf-8")
+        res = mind._mem_contract(self.root, timeout=5.0)
+        self.assertEqual(res["state"], "down")
+        self.assertIn("bad CONTRACT.local.json", res["detail"])
+
+    def test_protocol_mismatch_is_reported_as_drift(self):
+        self.write_contract()
+        for protocol in ("1999-01-01", "0.1"):
+            with self.subTest(protocol=protocol):
+                os.environ["STUB_PROTOCOL"] = protocol
+                rc, out = self.run_main("doctor", "mem")
+                self.assertEqual(rc, 1, out)
+                self.assertIn("contract: DRIFT", out)
+                self.assertIn("protocol mismatch", out)
+
     def test_drift_version(self):
         self.write_contract()
         os.environ["STUB_VERSION"] = "9.9.9"
@@ -1435,6 +1537,22 @@ class TestP0Recall(Base):
         self.assertIn("empty query", out)
 
 
+class TestProtocolPinsAgree(unittest.TestCase):
+    """MCP protocol version is pinned in 3 places; drift must fail loudly.
+
+    mem-bridge.py speaks it, mindlib/mcp.py falls back to it, CONTRACT.json
+    pins it. Single literal per file is intentional (decoupled processes),
+    but they must never disagree.
+    """
+
+    def test_bridge_mcp_and_contract_agree(self):
+        mod = mind.load_bridge()
+        contract = json.loads(
+            (SRC / "CONTRACT.json").read_text(encoding="utf-8"))
+        self.assertEqual(mod.MCP_PROTOCOL, mind.MCP_PROTOCOL_DEFAULT)
+        self.assertEqual(contract["protocol"], mod.MCP_PROTOCOL)
+
+
 class TestBridgeFailureModes(unittest.TestCase):
     """spawn/EOF/timeout/allowlist/show semantics of mem-bridge (review)."""
 
@@ -1497,8 +1615,7 @@ class TestBridgeFailureModes(unittest.TestCase):
             shutil.rmtree(root2, ignore_errors=True)
 
     def test_protocol_probe_detects_server_bump(self):
-        # the handshake sends a FALSY version; a drifted server reveals
-        # its own protocol and check_contract reports the pin mismatch
+        # A drifted peer reveals its own version and is rejected before use.
         os.environ["STUB_PROTOCOL"] = "1999-01-01"
         mod, br, root = self.make()
         try:
@@ -1506,10 +1623,9 @@ class TestBridgeFailureModes(unittest.TestCase):
             contract = {"protocol": "2024-11-05",
                         "serverInfo": {"name": "mem", "version": "2.0.0"},
                         "tools": list(PINNED_TOOLS)}
-            rep = br.check_contract(contract)
-            self.assertFalse(rep["ok"])
-            self.assertTrue(any("protocol" in d for d in rep["drifts"]),
-                            rep["drifts"])
+            with self.assertRaises(mod.ProtocolVersionError) as cm:
+                br.check_contract(contract)
+            self.assertIn("1999-01-01", str(cm.exception))
         finally:
             os.environ.pop("STUB_PROTOCOL", None)
             br.close()
@@ -1674,6 +1790,20 @@ class TestP0ReviewFixes(Base):
         self.assertEqual(f.read_text(encoding="utf-8"), raw,
                          "lossy file was rewritten")
 
+    def test_anchor_frontmatter_not_rewritten(self):
+        d = self.root / "MIND" / "insight"
+        d.mkdir(parents=True, exist_ok=True)
+        raw = ("---\ntype: insight\npath: anchored\nstatus: active\n"
+               "version: 1\nauthor: t\nupdated: 2026-11-25\n"
+               "scope: agent\nsummary: &summary anchored text\n"
+               "prediction: p\n---\nbody\n")
+        f = d / "anchored.md"
+        f.write_bytes(raw.encode("utf-8"))
+        rc, out = self.sync()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("NOT rewritten", out)
+        self.assertEqual(f.read_bytes(), raw.encode("utf-8"))
+
     def test_contract_missing_keys_is_down_not_traceback(self):
         # m8: a present-but-incomplete CONTRACT.json must not raise
         (self.root / "CONTRACT.json").write_text('{"protocol": "x"}',
@@ -1687,6 +1817,20 @@ class TestP0ReviewFixes(Base):
             with mind.MindLock(self.root):   # nested must not deadlock
                 pass
         self.assertFalse((self.root / "mind.lock").exists())
+
+    def test_mindlock_exit_handles_invalid_utf8_owner(self):
+        import mindlib.core as core
+        lock = mind.MindLock(self.root)
+        lock.path.write_bytes(b"\xff")
+        lock._owner = "owner"
+        lock.acquired = True
+        core._LOCK_HELD = True
+        try:
+            self.assertFalse(lock.__exit__(None, None, None))
+            self.assertFalse(core._LOCK_HELD)
+        finally:
+            core._LOCK_HELD = False
+            lock.path.unlink(missing_ok=True)
 
     def test_mindlock_exit_does_not_remove_replacement(self):
         lock = mind.MindLock(self.root)
@@ -1911,15 +2055,17 @@ class TestFindRoot(unittest.TestCase):
         self.assertEqual(mind.find_root(), other.resolve())
 
 
-REAL_MEM = Path(r"F:\AI\OLAMA\tools\mem.py")
+_real_mem_py, _real_mem_root, _real_mem_error = mind._resolve_mem_paths(SRC)
+REAL_MEM = Path(_real_mem_py) if not _real_mem_error else None
 
 
 class TestRealMemIntegration(unittest.TestCase):
     """DESIGN 12: integration smoke against the real mem (skip off-host)."""
 
     @unittest.skipUnless(
-        REAL_MEM.is_file() and (SRC / "CONTRACT.json").is_file(),
-        "real mem/CONTRACT.json not available")
+        REAL_MEM is not None and REAL_MEM.is_file()
+        and (SRC / "CONTRACT.json").is_file(),
+        "real mem paths not configured or unavailable")
     def test_real_doctor_ok_deep(self):
         res = mind._mem_contract(SRC, timeout=25.0, deep=True)
         self.assertEqual(res["state"], "ok",
