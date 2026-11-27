@@ -1829,6 +1829,15 @@ class TestVetoCommand(Base):
         self.assertEqual(rc, 2, out)
         self.assertIn("ACTION required", out)
 
+    def test_too_long_action_refused(self):
+        # audit 5.2.1: a huge ACTION must not reach the regex engine;
+        # refusing is honest - truncating would allow half-checked text
+        self.make("long", mode="block",
+                  rules=[{"id": "x", "pattern": "git push", "reason": "r"}])
+        rc, out = self.run_main("veto", "git push " + "a" * 5000)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("too long", out)
+
     def test_json_verdict(self):
         self.make("j", mode="block", rules=[
             {"id": "a", "pattern": "shutdown /s"}])
@@ -2064,6 +2073,27 @@ class TestMcpServe(Base):
         codes = [json.loads(l)["error"]["code"]
                  for l in stdout.getvalue().splitlines()]
         self.assertEqual(codes, [-32600, -32700])
+
+    def test_serve_rejects_oversized_line(self):
+        # audit 5.2.3: an oversized line is refused BEFORE json.loads
+        big = '{"jsonrpc": "2.0", "id": 1, "method": "x", "params": "' + \
+              "a" * mind.MCP_MAX_LINE + '"}\n'
+        stdin = io.StringIO(big + '{"jsonrpc": "2.0", "id": 2, '
+                                 '"method": "ping"}\n')
+        stdout = io.StringIO()
+        old = sys.stdin, sys.stdout
+        sys.stdin, sys.stdout = stdin, stdout
+        try:
+            rc = mind.cmd_serve(None)
+        finally:
+            sys.stdin, sys.stdout = old
+        self.assertEqual(rc, 0)
+        msgs = [json.loads(l) for l in stdout.getvalue().splitlines()]
+        self.assertEqual(msgs[0]["error"]["code"], -32600)
+        self.assertIn("too long", msgs[0]["error"]["message"])
+        # the server must survive the bad line and answer the next one
+        self.assertEqual(msgs[1]["id"], 2)
+        self.assertEqual(msgs[1]["result"], {})
 
 
 if __name__ == "__main__":

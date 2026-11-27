@@ -363,6 +363,16 @@ def open_db(root):
 
 LOCK_STALE_SECONDS = 300
 
+# ReDoS budget (audit 5.2.1): veto rules are local, but CPython re has
+# no timeout - a catastrophic pattern against a huge string hangs the
+# command (and the plugin's 60s cache refresh with it). Bound the input;
+# commands longer than this are not real shell one-liners anyway.
+VETO_ACTION_MAX = 4096
+
+# serve input bound (audit 5.2.3): stdio-local, but a runaway client
+# must not make the server buffer an unbounded line
+MCP_MAX_LINE = 1 * 1024 * 1024
+
 # in-process reentrancy: mutations hold the lock via main(), while
 # ensure_index/_run_sync called from READ commands must take it too
 # (review M1: reads rebuilt the store with no lock at all)
@@ -2371,6 +2381,8 @@ def cmd_veto(args):
         print("veto: ACTION required (or --list)")
         return 2
     hits = []
+    # compile every pattern once per run, before matching (audit 5.2.1)
+    compiled = []
     for s in settings:
         if s["mode"] == "off":
             continue
@@ -2378,10 +2390,21 @@ def cmd_veto(args):
             if not rule["pattern"]:
                 continue
             try:
-                rx = re.compile(rule["pattern"], re.IGNORECASE)
+                compiled.append((s, rule,
+                                 re.compile(rule["pattern"], re.IGNORECASE)))
             except re.error:
-                continue          # validate_record rejects, belt+braces
-            if args.list or rx.search(action or ""):
+                continue      # validate_record rejects, belt+braces
+    if args.list:
+        pass                  # listing never runs the patterns
+    elif action and len(action) > VETO_ACTION_MAX:
+        # refuse instead of truncating: a half-checked command would
+        # report "allow" for text we never looked at
+        print(f"veto: ACTION too long ({len(action)} > {VETO_ACTION_MAX} "
+              "chars), refusing to evaluate")
+        return 2
+    else:
+        for s, rule, rx in compiled:
+            if rx.search(action or ""):
                 hits.append({"setting": s["path"], "mode": s["mode"],
                              "executor": s["executor"], **rule})
     if args.list:
@@ -3077,6 +3100,12 @@ def cmd_serve(args):
     root = find_root()
     print(f"mind serve: root={root}", file=sys.stderr)
     for line in sys.stdin:
+        if len(line) > MCP_MAX_LINE:
+            # bound the parse cost of a runaway line (audit 5.2.3)
+            _mcp_send({"jsonrpc": "2.0", "id": None,
+                       "error": {"code": -32600,
+                                 "message": "invalid request (line too long)"}})
+            continue
         line = line.strip()
         if not line:
             continue
