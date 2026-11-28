@@ -141,10 +141,14 @@ class Base(unittest.TestCase):
             for key in ("MIND_MEM_PY", "MIND_MEM_ROOT")
         }
         os.environ["MIND_ROOT"] = str(self.root)
+        # write-path embed hook off by default: tests assert exact vector
+        # counts and must not depend on a live phone forward
+        os.environ["MIND_EMBED_HOOK"] = "0"
         (self.root / "MIND").mkdir()
 
     def tearDown(self):
         os.environ.pop("MIND_ROOT", None)
+        os.environ.pop("MIND_EMBED_HOOK", None)
         os.environ.pop("STUB_EXTRA_TOOL", None)
         os.environ.pop("STUB_VERSION", None)
         os.environ.pop("STUB_PROTOCOL", None)
@@ -830,6 +834,21 @@ class _EmbedStubHandler(http.server.BaseHTTPRequestHandler):
     # that share no words with the record (vector-only recall path)
     overrides = {}
 
+    def do_GET(self):
+        # health probe of the write-path hook / cmd_embed: the stub must
+        # answer /health like the phone llama-server does
+        if self.path.split("?")[0] == "/health":
+            body = b'{"status":"ok"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
         try:
@@ -927,6 +946,71 @@ class TestEmbedHybrid(Base):
         self.assertEqual(rc, 1, out)
         self.assertIn("remote unavailable", out)
         self.assertEqual(self.vec_count(), 0)
+
+    # -- embed lock ----------------------------------------------------
+    def test_live_lock_blocks_a_second_run(self):
+        self.make_trait()
+        lock = self.root / "mind.db.embed.lock"
+        lock.write_text(str(os.getpid()), encoding="ascii")   # live owner
+        rc, out = self.run_main("embed")
+        self.assertEqual(rc, 0, out)              # skip, not an error
+        self.assertIn("another run holds the lock", out)
+        self.assertEqual(self.vec_count(), 0)
+        lock.unlink()
+        rc, out = self.run_main("embed")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("1 vectors written", out)
+
+    def test_stale_lock_is_taken_over_and_released(self):
+        self.make_trait()
+        lock = self.root / "mind.db.embed.lock"
+        lock.write_text("999999999", encoding="ascii")   # dead pid
+        rc, out = self.run_main("embed")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("1 vectors written", out)
+        self.assertFalse(lock.exists())            # released on exit
+
+    # -- write-path hook (variant (b), 28.11) --------------------------
+    def _change_direction(self):
+        src = self.root / "upd.md"
+        src.write_text(mind.dump_frontmatter(
+            {"direction": "measure with a meter"}) + "x\n", encoding="utf-8")
+        return src
+
+    def test_hook_embeds_right_after_a_write(self):
+        tid = self.make_trait(body="measure everything twice\n")
+        os.environ["MIND_EMBED_HOOK"] = "1"
+        rc, out = self.run_main("update", str(tid), "--file",
+                                str(self._change_direction()))
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("embed:", out)            # the hook stays quiet
+        self.assertEqual(self.vec_count(), 1)      # filled without `embed`
+
+    def test_hook_defers_silently_when_remote_is_down(self):
+        tid = self.make_trait(body="measure everything twice\n")
+        os.environ["MIND_EMBED_HOOK"] = "1"
+        os.environ["MIND_EMBED_URL"] = self.DEAD_URL
+        rc, out = self.run_main("update", str(tid), "--file",
+                                str(self._change_direction()))
+        self.assertEqual(rc, 0, out)               # the mutation must not fail
+        self.assertNotIn("embed:", out)
+        self.assertEqual(self.vec_count(), 0)      # Mind-Embed finishes later
+
+    def test_hook_off_means_no_network_at_all(self):
+        tid = self.make_trait(body="measure everything twice\n")
+        # Base sets MIND_EMBED_HOOK=0
+        rc, out = self.run_main("update", str(tid), "--file",
+                                str(self._change_direction()))
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.vec_count(), 0)
+
+    def test_mcp_write_path_fills_vectors_too(self):
+        tid = self.make_trait(body="measure everything twice\n")
+        os.environ["MIND_EMBED_HOOK"] = "1"
+        out, err = mind._mcp_dispatch(
+            "update", {"target": tid, "text": "direction: metered\n"})
+        self.assertFalse(err, out)
+        self.assertEqual(self.vec_count(), 1)
 
     # -- recall: hybrid default (A/B gate passed 28.11.2026) -----------
     def test_default_recall_is_hybrid(self):

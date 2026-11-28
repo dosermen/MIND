@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from contextlib import contextmanager
 import hashlib
 import io
 import json
@@ -26,6 +27,7 @@ import time
 import traceback
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -1715,6 +1717,154 @@ def _embed_model():
     return os.environ.get("MIND_EMBED_MODEL", EMBED_MODEL_DEFAULT)
 
 
+def env_flag(name, default="1"):
+    """Truthy unless the env says 0/off/false/no. Explicit strings only:
+    `if os.environ.get(x)` would read the literal 'False' as ENABLED (mem)."""
+    return str(os.environ.get(name, default)).strip().lower() not in (
+        "0", "off", "false", "no", "")
+
+
+def env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+# write-path hook (28.11, variant (b), DESIGN 13): these four commands fill
+# vectors right after a mutation while the phone forward is already up; the
+# Mind-Embed task is the safety net for everything else and for dead remotes.
+WRITE_PATH = {cmd_remember, cmd_update, cmd_forget, cmd_restore}
+
+
+def health_url():
+    """GET /health on the same origin as the embeddings URL: the adb
+    forward keeps listening even when the phone-side llama-server is dead -
+    only /health tells the truth (mem 17.11)."""
+    try:
+        parts = urllib.parse.urlsplit(_embed_url())
+        if parts.scheme and parts.netloc:
+            return f"{parts.scheme}://{parts.netloc}/health"
+    except ValueError:
+        pass
+    return "http://127.0.0.1:5031/health"
+
+
+def server_ready(timeout=3):
+    """200 when the model is loaded (or sleeping: /health answers 200 and
+    the embeddings call itself wakes it up)."""
+    try:
+        with _opener.open(health_url(), timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def _pid_alive(pid):
+    """Windows-safe liveness probe. NEVER os.kill(pid, 0) on Windows: it
+    maps to TerminateProcess and would kill the lock owner (mem 16.11)."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            # 0x00100000 = SYNCHRONIZE (GENERIC_ALL made an access-denied
+            # live owner look dead and the lock got stolen - mem round-2)
+            handle = k32.OpenProcess(0x00100000, False, pid)
+            if not handle:
+                return False
+            try:
+                # WAIT_TIMEOUT (0x102) = still running, WAIT_OBJECT_0 = dead
+                return k32.WaitForSingleObject(handle, 0) == 0x102
+            finally:
+                k32.CloseHandle(handle)
+        except Exception:
+            return True               # can't tell -> respect the lock
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
+@contextmanager
+def embed_lock():
+    """Interlock with Phone-Embed-Watchdog: a mass embed legitimately holds
+    the phone busy for minutes, and a mid-request respawn looked like a
+    degraded cgroup (mem 15.11). The lock file next to mind.db tells the
+    watchdog to skip its latency probe/respawn while embed runs. Yields
+    True when the caller may embed, False when a live owner holds it."""
+    lock = Path(str(find_root() / "mind.db") + ".embed.lock")
+    # clamp: ttl <= 0 would expire every lock instantly and let a second
+    # run take over a live one (mem round-2 audit)
+    ttl = max(1.0, env_float("MIND_EMBED_LOCK_S", 3600))
+
+    def _hold():
+        """True while another run legitimately owns the lock."""
+        try:
+            if (time.time() - lock.stat().st_mtime) >= ttl:
+                return False              # TTL expired: take over
+            owner = int(lock.read_text(encoding="ascii").strip())
+        except OSError:
+            return False                  # vanished: nobody holds it
+        except ValueError:
+            return True                   # fresh but unreadable: respect it
+        return owner < 0 or _pid_alive(owner)
+
+    acquired = False
+    broken = False
+    try:
+        # atomic O_EXCL create: exists()+write_text lets two racers both
+        # pass and both embed (mem round-2 audit)
+        for _ in range(3):
+            try:
+                fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode("ascii"))
+                os.close(fd)
+                acquired = True
+                break
+            except FileExistsError:
+                if _hold():
+                    break                 # a live owner keeps it
+                try:
+                    lock.unlink()         # stale (dead owner / expired)
+                except OSError:
+                    pass
+    except OSError:
+        broken = True                     # lock not writable: run unlocked
+    try:
+        yield acquired or broken
+    finally:
+        if acquired:
+            try:
+                lock.unlink()
+            except OSError:
+                pass
+
+
+def embed_missing_quiet():
+    """Write-path hook (mem 1.3 port): fill vectors right after a
+    remember/update/forget/restore while the phone forward is already up.
+    Quiet and best effort - nothing pending means no network, a dead remote
+    or a busy lock just defers (the next Mind-Embed tick finishes it).
+    Never raises: a mutation must not fail because embedding did not."""
+    if not env_flag("MIND_EMBED_HOOK", "1"):
+        return
+    # health (3 s) instead of a bare TCP probe: the adb forward listens
+    # even when the phone-side llama is dead - only /health tells the truth
+    if not server_ready(timeout=3):
+        return
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            cmd_embed(argparse.Namespace(force=False))
+    except Exception:
+        return          # server went down mid-run: recall degrades to FTS
+
+
 def _vec_sig(text):
     return hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()
 
@@ -1787,6 +1937,8 @@ def cmd_embed(args):
     Increment by sig = sha1(search_text) + model: a rerun embeds only what
     is missing. Remote-only (phone via adb forward): a down server is
     rc=1 with already-written batches kept - the next run resumes.
+    Single-flight via embed_lock(): the watchdog must not respawn the phone
+    llama mid-request (mem 15.11).
     """
     root = find_root()
     ensure_index(root)
@@ -1816,20 +1968,28 @@ def cmd_embed(args):
             print(f"embed: 0 pending ({len(stored)} vectors current, "
                   f"model {model})")
             return 0
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        for i in range(0, len(todo), EMBED_BATCH):
-            batch = todo[i:i + EMBED_BATCH]
-            vecs = embed_texts([t for _, _, t in batch])
-            for (rid, sig, _), v in zip(batch, vecs):
-                db.execute(
-                    "INSERT INTO mind_vec (mem_id, sig, dim, model, vec, "
-                    "updated) VALUES (?,?,?,?,?,?) ON CONFLICT(mem_id) "
-                    "DO UPDATE SET sig=excluded.sig, dim=excluded.dim, "
-                    "model=excluded.model, vec=excluded.vec, "
-                    "updated=excluded.updated",
-                    (rid, sig, len(v), model, pack_vec(v), now))
-                done += 1
-            db.commit()
+        with embed_lock() as locked:
+            if not locked:
+                print("embed: another run holds the lock, skipping")
+                return 0
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            for i in range(0, len(todo), EMBED_BATCH):
+                batch = todo[i:i + EMBED_BATCH]
+                # health before every batch: a peer that accepted the
+                # first request may hang mid-run - fail fast, fill later
+                if not server_ready(timeout=3):
+                    raise RuntimeError("health probe failed")
+                vecs = embed_texts([t for _, _, t in batch])
+                for (rid, sig, _), v in zip(batch, vecs):
+                    db.execute(
+                        "INSERT INTO mind_vec (mem_id, sig, dim, model, vec, "
+                        "updated) VALUES (?,?,?,?,?,?) ON CONFLICT(mem_id) "
+                        "DO UPDATE SET sig=excluded.sig, dim=excluded.dim, "
+                        "model=excluded.model, vec=excluded.vec, "
+                        "updated=excluded.updated",
+                        (rid, sig, len(v), model, pack_vec(v), now))
+                    done += 1
+                db.commit()
     except (urllib.error.URLError, OSError, RuntimeError, ValueError) as e:
         db.commit()   # keep whatever the completed batches wrote
         print(f"embed: remote unavailable after {done} written "

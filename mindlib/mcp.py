@@ -272,6 +272,10 @@ def _mcp_dispatch(name, a):
         with lock, contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(err):
             rc = fn(ns)
+        # write-path hook (variant (b)): quiet, own buffer, after MindLock
+        # releases; a dead phone just defers to the Mind-Embed task
+        if rc in (0, None) and fn in WRITE_PATH:
+            embed_missing_quiet()
     except SystemExit as e:
         rc = e.code if isinstance(e.code, int) else 1
     except Exception as e:  # never kill the server on a tool error

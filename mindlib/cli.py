@@ -152,7 +152,13 @@ def main(argv=None):
     try:
         if fn in MUTATING:
             with MindLock(find_root()):
-                return fn(args) or 0
+                rc = fn(args) or 0
+            # write-path hook (variant (b)): fill vectors now while the
+            # phone forward is up - AFTER MindLock, so a mass embed never
+            # blocks other writers for minutes; Mind-Embed is the safety net
+            if rc == 0 and fn in WRITE_PATH:
+                embed_missing_quiet()
+            return rc
         return fn(args) or 0
     except KeyboardInterrupt:
         return 130

@@ -432,8 +432,18 @@ slice 1.5: embed — гибридный recall. **Реализовано 26.11**
   - Команды: `mind.py embed` (добивка недоставленных векторов) + гибридный
     `recall` с весами, старт с mem-замеренных 0.45/0.20/0.10/0.25
     (bm25/recency/importance/cosine), FTS-веса v0 остаются fallback'ом.
-  - Sweep: отдельная задача (hidden vbs) либо шаг в Mem-Sweep — решить при
-    реализации (embed пока ручной); инкремент по sig, без повторных embed.
+  - Sweep: **решено 28.11 — отдельная задача `Mind-Embed`** (`tools\mind-embed.ps1`
+    через run-hidden.vbs, каждые 10 мин, гейт 9:00–24:00 внутри скрипта, лог
+    `logs\mind-embed.log`, ротация 1 MB). Шаг в Mem-Sweep отклонён: изоляция
+    проектов (MIND не лезет в mem и наоборот). Инкремент по sig, без повторных
+    embed. Плюс **write-path хук** `embed_missing_quiet()` в
+    remember/update/forget/restore (CLI и MCP, вне MindLock): health-проба
+    `/health` (3 с) → добивка сразу при записи, пока forward жив; молча
+    деферит при мёртвом телефоне. Выключение — `MIND_EMBED_HOOK=0`.
+    Защита от watchdog-respawn: embed-лок `mind.db.embed.lock` (O_EXCL, TTL
+    3600 c, `MIND_EMBED_LOCK_S`, `_pid_alive` по SYNCHRONIZE), health перед
+    каждым батчем; watchdog пропускает latency-probe, пока свежий лок
+    (mem `MEMORY.md.embed.lock` **или** MIND) есть.
   - **Гейт полезности — ПРОЙДЕН 28.11.2026:** A/B 10 запросов + 1 контрольный
     на 12 записях (скрипт `ab-hybrid-gate.py`, телефон жив): hit@5 гибрид 8/10
     vs FTS 5/10, MRR 5.17 vs 3.83 — выигрыш заметный. Гибрид поднят в дефолт,
