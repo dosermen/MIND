@@ -35,6 +35,31 @@ python mind.py digest            # everything pending, one list
 python -m unittest discover -s tests
 ```
 
+## For agents
+
+The layer only pays off when it is consulted during work, not archived:
+
+- **Start of a non-trivial task** and **a pivot** (subject changed, went the
+  wrong way) - `mind_recall` first: has this been settled before?
+- **Verdicts, bugs, unexpected findings** - recall *before* deciding, so a
+  prior conclusion is neither rediscovered nor contradicted.
+- **Observation about yourself or your own work** - `mind_note ID TEXT
+  [--side up|down]` on a trait. Two same-side notes make `digest` remind
+  about a value recalibration; the rule is in
+  [docs/calibration.md](docs/calibration.md).
+- Do not recall after every step - session context already holds the
+  in-flight work.
+
+Gates are code, not etiquette: a new trait/habit stays a `candidate` until
+the user runs `trait approve` / `habit approve`, ideas follow their state
+machine, `veto` returns rc 1 on a hard block. Do not route around a gate,
+and never edit a trait `value` by hand.
+
+`python mind.py digest` - everything pending in one list (approvals, recalc
+reminders, ideas, contract drift). `profile` - compact self-block for a
+fresh session. Prefer the MCP tools when the server is configured; the CLI
+reads the same store.
+
 ## CLI
 
 | command | what it does |
