@@ -1843,7 +1843,8 @@ def cmd_embed(args):
 
 
 # ---------------------------------------------------------------------------
-# recall (v0 = FTS; hybrid opt-in via MIND_RECALL=hybrid, slice 1.5)
+# recall (v0 = FTS; hybrid default since A/B gate passed 28.11.2026,
+# slice 1.5; MIND_RECALL=fts opts back out to pure FTS)
 # ---------------------------------------------------------------------------
 
 def _preview(r):
@@ -1885,12 +1886,15 @@ def cmd_recall(args):
             rows = [r for r in rows if r["type"] == args.type]
         fts_ids = {r["id"] for r in rows}
 
-        # --- hybrid half (slice 1.5): cosine over mind_vec, opt-in via
-        # MIND_RECALL=hybrid. Default stays pure FTS until the A/B
-        # usefulness gate (DESIGN 13) passes on ~50 records.
+        # --- hybrid half (slice 1.5): cosine over mind_vec. Default is
+        # hybrid since the A/B usefulness gate passed (DESIGN 13,
+        # 28.11.2026: hit@5 8/10 vs FTS 5/10, MRR 5.17 vs 3.83 on 12
+        # records). MIND_RECALL=fts opts back out to pure FTS.
         mode = "fts (vectors: n/a)"
         cos_by_id = {}
-        if os.environ.get("MIND_RECALL", "fts").lower() == "hybrid":
+        if os.environ.get("MIND_RECALL", "hybrid").lower() == "fts":
+            mode = "fts (opt-out)"   # vectors may exist; user chose FTS
+        else:
             vec_rows = list(db.execute(
                 "SELECT v.mem_id, v.vec FROM mind_vec v "
                 "JOIN memories m ON m.id = v.mem_id "

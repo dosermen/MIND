@@ -13,7 +13,7 @@
 
   <rect width="1200" height="870" fill="#f8fafc"/>
   <text x="20" y="32" font-size="20" font-weight="bold" fill="#0f172a">MIND — как всё работает (mindlib, 27.11.2026)</text>
-  <text x="20" y="52" font-size="12.5" fill="#64748b">md = источник истины, mind.db = производный индекс; гейты в коде (красная рамка = гейт); frontmatter — lossy-подмножество YAML; гибрид recall — opt-in до A/B-гейта</text>
+  <text x="20" y="52" font-size="12.5" fill="#64748b">md = источник истины, mind.db = производный индекс; гейты в коде (красная рамка = гейт); frontmatter — lossy-подмножество YAML; гибрид recall — дефолт после A/B-гейта 28.11.2026</text>
 
   <!-- ===== column headers ===== -->
   <text x="20" y="84" font-size="13.5" font-weight="bold" fill="#7c3aed" letter-spacing="1">ИСТОЧНИКИ</text>
@@ -74,9 +74,9 @@
   <text x="814" y="219" font-size="12" fill="#475569">кандидаты, recalc_pending (2×side), WIP, expires</text>
 
   <rect x="800" y="247" width="380" height="78" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
-  <text x="814" y="273" font-size="13.5" font-weight="bold" fill="#0f172a">recall — FTS, гибрид opt-in</text>
+  <text x="814" y="273" font-size="13.5" font-weight="bold" fill="#0f172a">recall — гибрид (дефолт), opt-out FTS</text>
   <text x="814" y="295" font-size="12" fill="#475569">fts: 0.60·bm25 + 0.25·recency + 0.15·imp</text>
-  <text x="814" y="315" font-size="12" fill="#475569">MIND_RECALL=hybrid: + 0.25·cosine (телефон)</text>
+  <text x="814" y="315" font-size="12" fill="#475569">+ 0.25·cosine (телефон); MIND_RECALL=fts → чистый FTS</text>
 
   <rect x="800" y="337" width="380" height="92" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
   <text x="814" y="362" font-size="13.5" font-weight="bold" fill="#0f172a">veto --list --json → плагин mind-veto</text>

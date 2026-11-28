@@ -853,7 +853,7 @@ class _EmbedStubHandler(http.server.BaseHTTPRequestHandler):
 
 
 class TestEmbedHybrid(Base):
-    """`embed` (mind_vec, sig increment, remote-only) + MIND_RECALL=hybrid."""
+    """`embed` (mind_vec, sig increment, remote-only) + recall modes."""
 
     DEAD_URL = "http://127.0.0.1:9/v1/embeddings"   # discard port: refused
 
@@ -928,14 +928,23 @@ class TestEmbedHybrid(Base):
         self.assertIn("remote unavailable", out)
         self.assertEqual(self.vec_count(), 0)
 
-    # -- recall: opt-in hybrid ----------------------------------------
-    def test_default_recall_stays_fts(self):
+    # -- recall: hybrid default (A/B gate passed 28.11.2026) -----------
+    def test_default_recall_is_hybrid(self):
         self.make_trait(body="needle in a haystack\n")
         rc, out = self.run_main("embed")
         self.assertEqual(rc, 0, out)
         rc, out = self.run_main("recall", "needle")
         self.assertEqual(rc, 0, out)
-        self.assertIn("mode: fts (vectors: n/a)", out)
+        self.assertIn("mode: hybrid", out)
+
+    def test_env_fts_opts_out_of_hybrid(self):
+        self.make_trait(body="needle in a haystack\n")
+        rc, out = self.run_main("embed")
+        self.assertEqual(rc, 0, out)
+        os.environ["MIND_RECALL"] = "fts"
+        rc, out = self.run_main("recall", "needle")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("mode: fts (opt-out)", out)
 
     def test_hybrid_footer_and_ranking(self):
         self.make_trait(body="needle in a haystack\n")
@@ -979,10 +988,11 @@ class TestEmbedHybrid(Base):
             db.close()
         _EmbedStubHandler.overrides["hidden needle"] = list(vec)
         # pure FTS cannot see it (0 hits)...
+        os.environ["MIND_RECALL"] = "fts"
         rc, out = self.run_main("recall", "hidden needle")
         self.assertEqual(rc, 1, out)
-        # ...hybrid can
-        os.environ["MIND_RECALL"] = "hybrid"
+        # ...hybrid (now the default) can
+        os.environ.pop("MIND_RECALL", None)
         rc, out = self.run_main("recall", "hidden needle")
         self.assertEqual(rc, 0, out)
         self.assertIn("rigor", out)

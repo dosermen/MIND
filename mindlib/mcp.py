@@ -38,8 +38,9 @@ def _mcp_tools():
                    "description": "id, id@vN or path (citation rules)"}
     return [
         {"name": "recall",
-         "description": "Search MIND records (FTS; hybrid when "
-                        "MIND_RECALL=hybrid). Footer names the mode.",
+         "description": "Search MIND records (hybrid by default; "
+                        "MIND_RECALL=fts for pure FTS). Footer names "
+                        "the mode.",
          "inputSchema": {"type": "object", "properties": {
              "query": {"type": "string"},
              "limit": {"type": "integer"},

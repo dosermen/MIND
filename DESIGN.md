@@ -14,8 +14,8 @@
 4. Никаких правок в `F:\AI\MEM` и `F:\AI\OLAMA\memory`.
 5. ASCII в коде; русский — в md/документации.
 6. Embedding (slice 1.5): каскад ТОЛЬКО remote (телефон) → FTS; локальный
-   embed-server не поднимать. Recall по умолчанию FTS (`mode: fts (vectors: n/a)`),
-   гибрид — opt-in `MIND_RECALL=hybrid` до A/B-гейта (~50 записей, §13).
+   embed-server не поднимать. Recall по умолчанию — гибрид (A/B-гейт пройден
+   28.11.2026, §13); чистый FTS — opt-out `MIND_RECALL=fts`.
 
 ## 1. Раскладка
 
@@ -270,7 +270,7 @@ digest-секция `recalc_pending` («N×side → предложи value±0.1�
 - Вывод: `id@vN [type] path (updated, score)` + тело + `related_mind -> ..` / `related_mem -> ..`
   в конце: `mode: fts (vectors: n/a)`.
 
-### Гибрид (slice 1.5, opt-in `MIND_RECALL=hybrid`)
+### Гибрид (slice 1.5, дефолт с 28.11.2026; opt-out `MIND_RECALL=fts`)
 
 - Своя таблица `mind_vec` в mind.db (dim/model на строку, sig = sha1(content));
   `mind.py embed` добивает недостающее батчами (EMBED_BATCH 16) через remote
@@ -281,7 +281,8 @@ digest-секция `recalc_pending` («N×side → предложи value±0.1�
   (веса mem, замеренные 16.11); bm25 у векторного добра = 0; cos clamp [0,1].
 - Футеры честные: `hybrid` / `hybrid partial k/n` / `fts (no vectors yet)` /
   `fts (remote server down)` (телефон мёртв — молча отдаём FTS, как mem).
-- Дефолт остаётся чистым FTS до A/B-гейта (§13): без замера гибрид не включается.
+- Дефолт — гибрид с 28.11.2026: A/B-гейт (§13) пройден на 12 записях
+  (hit@5 8/10 против 5/10 у FTS, MRR 5.17 против 3.83). Откат — `MIND_RECALL=fts`.
 
 ### MCP serve (slice 1) — `python mind.py serve`
 
@@ -433,10 +434,11 @@ slice 1.5: embed — гибридный recall. **Реализовано 26.11**
     (bm25/recency/importance/cosine), FTS-веса v0 остаются fallback'ом.
   - Sweep: отдельная задача (hidden vbs) либо шаг в Mem-Sweep — решить при
     реализации (embed пока ручной); инкремент по sig, без повторных embed.
-  - **Гейт полезности (обязателен, ОСТАЁТСЯ):** после калибровки, на ~50 записях —
-    A/B 10 запросов FTS vs гибрид; выигрыш < заметного → откатиться на FTS
-    и честно зафиксировать вердикт в память. Без замера не оставлять
-    (поэтому гибрид opt-in `MIND_RECALL=hybrid`, дефолт — FTS).
+  - **Гейт полезности — ПРОЙДЕН 28.11.2026:** A/B 10 запросов + 1 контрольный
+    на 12 записях (скрипт `ab-hybrid-gate.py`, телефон жив): hit@5 гибрид 8/10
+    vs FTS 5/10, MRR 5.17 vs 3.83 — выигрыш заметный. Гибрид поднят в дефолт,
+    откат — `MIND_RECALL=fts`. Оговорка: выборка 12 < ~50 записей, при росте
+    базы A/B повторить (скрипт сохранён).
 slice 2: автоматика digest (фоновая задача через run-hidden.vbs).
 slice 3: eligible-журнал + детектор привычек.
 slice 4: resurrect (ночной, cosine >= 0.75 — порог doc_links mem).
